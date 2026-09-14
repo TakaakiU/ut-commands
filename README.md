@@ -24,6 +24,7 @@ Claude Code の個人用スラッシュコマンド集です。作者が自分�
 | --- | --- |
 | `tools/deploy.mjs` | 正本 ⇄ 実行場所の配置・回収と整合性検査（`--check`） |
 | `tools/mask.mjs` | 外部へ出す Markdown から機微値を落とす最小限のマスク（`--selftest` に回帰テスト内蔵） |
+| `tools/usage-stats.mjs` | 各コマンドの実呼び出し回数を Claude / Codex のセッション記録から集計する（コマンド名と日付だけを読み、会話本文は保持しない） |
 | `codex-prompts/ut.md` | 同じコマンドを Codex 側から呼ぶためのラッパー |
 | `commands/templates/` | `ut-report` の HTML 出力テンプレート |
 

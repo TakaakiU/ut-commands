@@ -24,6 +24,12 @@
 `ut-*` は `.claude/commands/` 形式（旧形式）を使っている。動作は継続するが、
 **docs サイトの frontmatter 表は「skills 全般」の表**である。コマンド専用の表ではない。
 
+> A Markdown file in `.claude/commands/` is the older format and still works.
+> It supports the same frontmatter except `name` and `paths`.
+
+つまり `name` と `paths` は `.claude/commands/` 形式では使えない。
+本書で両方を「不要」としているのは結果的に正しいが、**理由は「不要」ではなく「使えない」**である。
+
 ## 1.2 配布経路でフィールドの許容範囲が変わる
 
 ⚠️ **Claude Code の中と外で、使えるフィールドが違う。**
@@ -130,10 +136,10 @@ metadata:
 | `arguments`（名前付き引数） | 次段階 | `$ARGUMENTS` を本文で解釈するより誤用が減る。既存13本の引数仕様を一度に変えるのは別作業 |
 | `license` / `compatibility` | 次段階 | Agent Skills 仕様。Claude Code は受け取るが何もしない。公開する分に入れる価値がある |
 | `user-invocable` | 不要 | `ut-*` はすべて人が打つもの。既定（`true`）でよい |
-| `paths` | 不要 | ファイル種別で自動起動させる設計にしていない |
+| `paths` | **使えない** | `.claude/commands/` 形式では対象外（skills ディレクトリ形式なら使える） |
 | `hooks` / `shell` | 不要 | 現状そこまでの制御を必要としていない |
 | `when_to_use` | 不要 | 全本 `disable-model-invocation: true` で自動起動しないため、効く場面が無い |
-| `name` | 不要 | ファイル名と一致させる運用にしている |
+| `name` | **使えない** | `.claude/commands/` 形式では対象外。コマンド名はファイル名で決まる |
 
 ### `description` の長さ
 
