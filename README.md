@@ -17,6 +17,9 @@ Claude Code の個人用スラッシュコマンド集です。作者が自分�
 | `/ut-sqlpatch` | 調査結果から手動DB復旧SQLを**確認 / 適用 / ロールバックの3本**に分けて生成する（DBへは接続しない） |
 | `/ut-diskreport` | Windows Cドライブの大容量・削除候補を**安全度別**にレポートする |
 | `/ut-copyblock` | 別媒体へ移す SQL・コード・文面などを、1単位＝1コードブロックで出力する応答モード |
+| `/ut-commentrewrite` | 作業ブランチの差分で追加・変更されたソースコメントを、経緯を知らない読者に意味が通る形へ書き直す。**コメントを除いたソースがバイト一致すること**を機械照合してからでないと適用しない |
+| `/ut-backlogformat` | 手元の Markdown を Backlog（Nulab）の記法へ変換する。**どちらの記法モードかを実機で判定してから**変換し、投稿はしない |
+| `/ut-vscode-debug` | .NET / ASP.NET Core の Web プロジェクトを、VS Code の F5 から HTTPS Kestrel でデバッグ実行できるよう `launch.json` / `tasks.json` を整備する |
 
 補助として次を同梱しています。
 
@@ -27,6 +30,8 @@ Claude Code の個人用スラッシュコマンド集です。作者が自分�
 | `tools/usage-stats.mjs` | 各コマンドの実呼び出し回数を Claude / Codex のセッション記録から集計する（コマンド名と日付だけを読み、会話本文は保持しない） |
 | `codex-prompts/ut.md` | 同じコマンドを Codex 側から呼ぶためのラッパー |
 | `commands/templates/` | `ut-report` の HTML 出力テンプレート |
+| `docs/command-design.md` | コマンドの frontmatter をどう使うか、何を採らないか。判断理由と限界も残している |
+| `docs/vscode-ai-shortcuts.md` | VS Code で AI チャットへフォーカスするキー割り当ての記録 |
 
 ## 導入
 
