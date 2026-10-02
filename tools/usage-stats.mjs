@@ -8,7 +8,7 @@
 // **Claude 側だけを見ると数を取りこぼす。** 呼び出し経路が3つあるため。
 //   1. Claude で `/ut-xxx` と打つ        → transcript に <command-name> が入る
 //   2. Claude で `ut-xxx` と打つ(スラッシュ無し) → <command-name> が入らない
-//   3. Codex から codex-prompts/ut.md 経由 → Claude 側の記録に残らない
+//   3. Codex から ut ラッパー経由（skills の $ut。2026-09-30 より前の記録は旧 custom prompts の /prompts:ut。どちらも CMD=ut-xxx の形）→ Claude 側の記録に残らない
 // 実測では 1 だけを数えて 49 回、3経路すべてで 123 回だった。
 // 経路を1つ落とすと、そのコマンドが「未使用」に見える。
 import fs from 'node:fs';

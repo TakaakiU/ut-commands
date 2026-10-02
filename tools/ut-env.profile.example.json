@@ -1,0 +1,9 @@
+{
+  "source": "C:/path/to/main-checkout",
+  "sets": {
+    "review": [
+      ".claude/commands/review/**",
+      ".claude/scripts/**"
+    ]
+  }
+}

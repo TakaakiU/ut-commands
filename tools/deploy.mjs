@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // deploy.mjs — ut-* 個人コマンド類を、正本(このリポジトリ)と
-// 実行場所(~/.claude/commands/, ~/.codex/prompts/)の間で配置/回収する。
+// 実行場所(~/.claude/commands/, ~/.agents/skills/)の間で配置/回収する。
 //
 // 設計上の約束:
 //   1. 既定は dry-run。書き込むには --apply / --capture を明示する。
@@ -8,8 +8,9 @@
 //   3. 両側の内容が食い違っている場合は既定でブロックする。どちら向きに上書きするかは
 //      人間が決めるべきで、暗黙に選ぶと反対側の編集が消える。--force で上書き(退避を残す)。
 //   4. Claude 対象は ut-*.md と許可済み templates のみ。~/.claude/commands/ に同居する
-//      他者所有ファイルには触らない。Codex 対象は codex-prompts/*.md のみで、他の
-//      ~/.codex/prompts/* には触らない。
+//      他者所有ファイルには触らない。Codex skills 対象は codex-skills/<名前>/ の SKILL.md と
+//      agents/openai.yaml のみ。~/.agents/skills/ の他の skill は列挙もしない。同名でも管理の記録
+//      (~/.agents/skills/.ut-commands-managed.json)に無い skill は --force でも引き取らない。
 //   5. 比較は LF 正規化後の内容ハッシュ。core.autocrlf=true の環境で改行差を
 //      「変更」と誤検知しないため。
 //   6. --apply / --capture の前に整合性検査(--check)を通す。検査対象は「向き」で変える。
@@ -21,8 +22,8 @@
 //   node tools/deploy.mjs --check                  # 整合性検査のみ(書き込まない)
 //   node tools/deploy.mjs --target claude --apply # 正本 → ~/.claude/commands/
 //   node tools/deploy.mjs --target claude --capture
-//   node tools/deploy.mjs --target codex --apply  # 正本 → ~/.codex/prompts/
-//   node tools/deploy.mjs --target codex --capture
+//   node tools/deploy.mjs --target codex-skills --apply   # 正本 → ~/.agents/skills/
+//   node tools/deploy.mjs --target codex-skills --capture
 //
 // 終了コード: 0=成功/作業不要, 1=食い違いによりブロック, 2=エラー, 3=整合性検査NG
 
@@ -60,17 +61,50 @@ const TARGETS = {
       return [...topLevel, ...templates].sort();
     },
   },
-  codex: {
-    repoDir: path.join(REPO_ROOT, 'codex-prompts'),
-    repoDirName: 'codex-prompts',
-    liveDir: path.join(HOME, '.codex', 'prompts'),
-    description: 'Codex custom prompts',
-    filePatternLabel: '*.md',
+  // Codex skills（custom prompts の後継）。配置先はユーザー単位の ~/.agents/skills。
+  // 扱うのは codex-skills/ にある skill の名前と、その中の決まったファイル（SKILL_FILES）だけ。
+  // 配置先の他の skill は列挙もしない（他者の skill を取り込んだり上書きしたりしないため）
+  'codex-skills': {
+    repoDir: path.join(REPO_ROOT, 'codex-skills'),
+    repoDirName: 'codex-skills',
+    liveDir: path.join(HOME, '.agents', 'skills'),
+    description: 'Codex skills（自動の呼び出しは止める）',
+    filePatternLabel: '<name>/agents/openai.yaml + <name>/SKILL.md',
     restartHint: 'Codex のセッションを開き直すと反映されます。',
     listFiles(dir) {
-      return listTopLevelFiles(dir).filter((n) => n.endsWith(SUFFIX)).sort();
+      const out = [];
+      for (const name of managedSkillNames()) {
+        for (const f of SKILL_FILES) {
+          const rel = path.join(name, ...f.split('/'));
+          if (fs.existsSync(path.join(dir, rel))) out.push(rel);
+        }
+      }
+      return out;
     },
   },
+};
+
+// skill の中で配置するファイル。自動の呼び出しを止める設定（openai.yaml）を先に書き、入口（SKILL.md）を最後に書く。
+// 途中で止まっても、設定の無い入口が Codex から見える状態を作らないため
+const SKILL_FILES = ['agents/openai.yaml', 'SKILL.md'];
+// openai.yaml の正規の形。文字列を探すのではなく、この形との完全一致で判定する
+// （コメントの中の false、階層の誤り、"false" のような文字列、重複キー、構文の誤りは、すべて不一致になる）
+const SKILL_POLICY = 'policy:\n  allow_implicit_invocation: false\n';
+const SKILL_NAME_RE = /^[a-z0-9][a-z0-9-]*$/;
+function managedSkillNames() {
+  let entries;
+  try { entries = fs.readdirSync(path.join(REPO_ROOT, 'codex-skills'), { withFileTypes: true }); } catch (e) {
+    if (e.code === 'ENOENT') return [];
+    throw e;
+  }
+  // リンク（ジャンクション）も数える。数えないと、その skill は黙って配置の対象から外れる。数えた上で、書き込みの前のリンクの確認が止める
+  return entries.filter((e) => (e.isDirectory() || e.isSymbolicLink()) && SKILL_NAME_RE.test(e.name)).map((e) => e.name).sort();
+}
+// 1つの skill の中では openai.yaml を SKILL.md より先に処理する
+const fileOrder = (name) => {
+  const p = name.split(path.sep).join('/');
+  const i = SKILL_FILES.findIndex((f) => p.endsWith('/' + f));
+  return i < 0 ? 0 : i;
 };
 
 const argv = process.argv.slice(2);
@@ -89,8 +123,9 @@ for (let i = 0; i < argv.length; i++) {
 }
 if (unknown.length) fail(`不明な引数: ${unknown.join(' ')}`);
 if (has('--help') || has('-h')) { usage(); process.exit(0); }
-if (targetIndex >= 0 && !argv[targetIndex + 1]) fail('--target の値がありません。claude または codex を指定してください。');
-if (!(targetName in TARGETS)) fail(`不明な target: ${targetName} (claude / codex のみ対応)。`);
+if (targetIndex >= 0 && !argv[targetIndex + 1]) fail('--target の値がありません。claude / codex-skills のいずれかを指定してください。');
+if (targetName === 'codex') fail('--target codex（旧入口の custom prompts）は撤去しました。Codex 側は --target codex-skills を使ってください（配置済みの ~/.codex/prompts/ の旧ファイルは削除しないので、要らなければ手で消す）。');
+if (!Object.hasOwn(TARGETS, targetName)) fail(`不明な target: ${targetName} (claude / codex-skills のみ対応)。`);
 if (has('--apply') && has('--capture')) {
   fail('--apply と --capture は同時に指定できません(どちら向きに上書きするかが決まらない)。');
 }
@@ -133,9 +168,10 @@ function listCommands(dir) {
   return target.listFiles(dir);
 }
 
+// 一時ファイルは一意な名前で、既にあるものは開かない（wx）。固定名だと、そこがリンクにすり替えられていたときにリンクの先を上書きする
 function writeAtomic(dest, buf) {
-  const tmp = `${dest}.tmp`;
-  fs.writeFileSync(tmp, buf);
+  const tmp = `${dest}.${process.pid}.${createHash('sha256').update(String(Math.random()) + Date.now()).digest('hex').slice(0, 8)}.tmp`;
+  fs.writeFileSync(tmp, buf, { flag: 'wx' });
   fs.renameSync(tmp, dest);
 }
 
@@ -167,16 +203,19 @@ function usage() {
   node tools/deploy.mjs --check                        整合性検査のみ(書き込まない)
   node tools/deploy.mjs --target claude --apply       正本 → ${TARGETS.claude.liveDir}
   node tools/deploy.mjs --target claude --capture     ${TARGETS.claude.liveDir} → 正本
-  node tools/deploy.mjs --target codex --apply        正本 → ${TARGETS.codex.liveDir}
-  node tools/deploy.mjs --target codex --capture      ${TARGETS.codex.liveDir} → 正本
+  node tools/deploy.mjs --target codex-skills --apply ${TARGETS['codex-skills'].liveDir} へ skills を配置（codex-skills/ にある skill だけ）
+  node tools/deploy.mjs --target codex-skills --capture ${TARGETS['codex-skills'].liveDir} → 正本（同上）
   node tools/deploy.mjs ... --force                   食い違いも上書き(上書き前に .bak-<時刻>-<ミリ秒> を残す)
   node tools/deploy.mjs ... --no-check                前段の整合性検査をスキップ(緊急時のみ)
 
-Claude 対象は ut-*.md と許可済み templates のみ、Codex 対象は codex-prompts/*.md のみ。削除は行わない。
+Claude 対象は ut-*.md と許可済み templates のみ、
+Codex skills 対象は codex-skills/<名前>/ の SKILL.md と agents/openai.yaml のみ。削除は行わない。
 --apply / --capture は前段で整合性検査を通す。--capture は取り込み後の状態を検査する。
 検査項目: C1 中身表とファイルの一致 / C2 ut-* の6節骨格 / C3 templates 参照の実在 /
           C4 Codexラッパー一覧の一致 / C5 README 行数(警告) / C6 未配備テンプレート(警告) /
-          C7 表の重複掲載 / C9 外部参照の陳腐化(警告) / C10 機微値の混入`);
+          C7 表の重複掲載 / C9 外部参照の陳腐化(警告) / C10 機微値の混入 /
+          C13 skills の自動の呼び出しの停止（C10 と C13 は --no-check でも必ず実行する） /
+          C14 codex-skills/ に配置の対象外のファイルが無い`);
 }
 
 // ---- 整合性検査(--check) ------------------------------------------------
@@ -296,6 +335,7 @@ function duplicates(list) {
 // (--single-branch clone では相手ブランチの ref が存在しない)。
 
 // 社内固有の参照先(他ブランチ・社内プラグイン)は tools/external-refs.json へ外出しした。
+// （publish-ref-ok: tools/external-refs.json 上流の作業リポジトリにだけある設定。公開物では無いため C9 を実行せず、その旨を表示する）
 // deploy.mjs 自体を汎用に保ち、公開用ビルドで本文を書き換えずに済ませるため。
 // 設定が無い環境では C9 を skip するが、**「設定なし」を明示して黙って通さない**。
 const EXTERNAL_REFS_FILE = path.join(REPO_ROOT, "tools", "external-refs.json");
@@ -324,6 +364,7 @@ function loadExternalRefs() {
   try {
     return raw.map((r) => ({
       ...r,
+      wrappers: Array.isArray(r.wrappers) ? r.wrappers : [r.wrapper].filter(Boolean),
       localCandidates: [
         r.localCandidateEnv ? process.env[r.localCandidateEnv] : undefined,
         ...(r.localCandidates || []),
@@ -421,44 +462,48 @@ function checkExternalRefs(tree, add) {
     return;
   }
   for (const spec of specs) {
-    const buf = tree.read(spec.wrapper);
-    if (!buf) continue;
-    const text = normLF(buf.toString('utf8'));
+    if (!spec.wrappers.length) { add('C9', 'error', '外部参照の設定に wrapper がありません。'); continue; }
+    for (const wrapper of spec.wrappers) {
+      const buf = tree.read(wrapper);
+      // 設定が指すラッパーが無いと、検査が何もしないまま通る（移行でパスが変わったのに設定が古い、など）
+      if (!buf) { add('C9', 'error', `外部参照の設定が指すラッパーが無い: ${wrapper}（tools/external-refs.json を直す）`); continue; }
+      const text = normLF(buf.toString('utf8'));
 
-    // 廃止済みパスへの逆戻りを先に見る。存在検査では捕まらない（別構造なので prefix に
-    // 一致せず、抽出対象にすら入らない）ため、明示的な禁止パターンとして持つ。
-    for (const bad of spec.obsoletePatterns || []) {
-      if (text.includes(bad)) {
-        add('C9', 'warning', `${spec.wrapper} に廃止済みの外部パスが残っている: ${bad}`);
+      // 廃止済みパスへの逆戻りを先に見る。存在検査では捕まらない（別構造なので prefix に
+      // 一致せず、抽出対象にすら入らない）ため、明示的な禁止パターンとして持つ。
+      for (const bad of spec.obsoletePatterns || []) {
+        if (text.includes(bad)) {
+          add('C9', 'warning', `${wrapper} に廃止済みの外部パスが残っている: ${bad}`);
+        }
       }
-    }
 
-    // パス抽出とコマンド名抽出は分けて数える。コマンド名が取れているだけで
-    // 「参照構造は健在」と誤判定しないため。
-    const fromPaths = new Set();
-    extractExternalPaths(text, spec.pathPrefix, spec.pathPrefix, fromPaths);
-    for (const alias of spec.rootAliases || []) {
-      extractExternalPaths(text, alias, spec.pathPrefix, fromPaths);
-    }
-    if (!fromPaths.size) {
-      add('C9', 'warning', `${spec.wrapper} から外部パス参照(${spec.pathPrefix}) が1件も抽出できない。参照構造が変わった可能性がある。`);
-    }
-
-    const wanted = new Set(fromPaths);
-    const m = spec.commandListRe.exec(text);
-    if (m) {
-      for (const q of m[1].match(/`([^`]+)`/g) || []) {
-        wanted.add(spec.commandDir + q.replace(/`/g, '') + '.md');
+      // パス抽出とコマンド名抽出は分けて数える。コマンド名が取れているだけで
+      // 「参照構造は健在」と誤判定しないため。
+      const fromPaths = new Set();
+      extractExternalPaths(text, spec.pathPrefix, spec.pathPrefix, fromPaths);
+      for (const alias of spec.rootAliases || []) {
+        extractExternalPaths(text, alias, spec.pathPrefix, fromPaths);
       }
-    } else {
-      add('C9', 'warning', `${spec.wrapper} からコマンド許可リストを読み取れない。書式が変わった可能性がある。`);
-    }
-    if (!wanted.size) continue;
+      if (!fromPaths.size) {
+        add('C9', 'warning', `${wrapper} から外部パス参照(${spec.pathPrefix}) が1件も抽出できない。参照構造が変わった可能性がある。`);
+      }
 
-    const src = resolveExternalSource(spec);
-    if (!src) continue;
-    for (const rel of [...wanted].sort().filter((r) => !src.exists(r))) {
-      add('C9', 'warning', `${spec.wrapper} が参照する外部パスが ${src.label} に見つからない: ${rel}`);
+      const wanted = new Set(fromPaths);
+      const m = spec.commandListRe.exec(text);
+      if (m) {
+        for (const q of m[1].match(/`([^`]+)`/g) || []) {
+          wanted.add(spec.commandDir + q.replace(/`/g, '') + '.md');
+        }
+      } else {
+        add('C9', 'warning', `${wrapper} からコマンド許可リストを読み取れない。書式が変わった可能性がある。`);
+      }
+      if (!wanted.size) continue;
+
+      const src = resolveExternalSource(spec);
+      if (!src) continue;
+      for (const rel of [...wanted].sort().filter((r) => !src.exists(r))) {
+        add('C9', 'warning', `${wrapper} が参照する外部パスが ${src.label} に見つからない: ${rel}`);
+      }
     }
   }
 }
@@ -525,11 +570,11 @@ function runChecks(captureTarget) {
     for (const d of duplicates(contentRows)) add('C7', 'error', `「中身」表が重複掲載: ${d}`);
   }
 
-  // C4: 「Codex ラッパー一覧」表が codex-prompts/*.md と一致するか
+  // C4: 「Codex ラッパー一覧」表が、入口の単位（名前）で codex-skills/<名前>/ と一致するか（ファイルの単位の照合は C1 が行う）
   const wrapperRows = readmeLines && tableFirstColumn(readmeLines, /^##\s+Codex\s+ラッパー一覧\s*$/);
   if (readmeLines && !wrapperRows) add('C4', 'error', `${README_REL} に「## Codex ラッパー一覧」の表が見つかりません。`);
   if (wrapperRows) {
-    const expected = tree.listFiles('codex').map((n) => n.replace(/\.md$/, '')).sort();
+    const expected = managedSkillNames().sort();
     const { missing, extra } = diffSets(expected, wrapperRows);
     for (const m of missing) add('C4', 'error', `Codexラッパー一覧に未掲載: ${m}`);
     for (const x of extra) add('C4', 'error', `Codexラッパー一覧に実在しない行: ${x}`);
@@ -589,13 +634,90 @@ function runChecks(captureTarget) {
   checkExternalRefs(tree, add);
   checkClassification(tree, add);
 
+  // C13: skills の自動の呼び出しを止めているか（C10 と同じく --no-check でも必ず実行する）
+  checkSkills(tree, add);
+
   return findings;
+}
+
+// ---- C13: skills の自動の呼び出しの停止 -----------------------------------
+// ut-* は「人が明示したときだけ動く」。Codex の skills は既定で、内容から判断して自動で呼ばれる
+// （実機で確認: 何もしないと内容に合う依頼で 3/3 回起動した）。skill のフォルダの agents/openai.yaml で
+// policy.allow_implicit_invocation を false にすると止まる（同 0/3 回）。止め忘れを人の注意に任せない
+// codex-skills/ の下にある「管理すべきファイル」の一覧。git の追跡・未追跡（.gitignore の対象を除く）で数える。
+// 退避（*.bak-*）・書きかけ（*.tmp）・OS が作るファイルで検査が止まらないようにするため（--capture の退避で実際に止まった）
+function skillRepoFiles() {
+  try {
+    return execFileSync('git', ['-C', REPO_ROOT, '-c', 'core.quotepath=false', 'ls-files', '-c', '-o', '--exclude-standard', '--', 'codex-skills'],
+      { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }).split('\n').filter(Boolean)
+      .filter((f) => fs.existsSync(path.join(REPO_ROOT, ...f.split('/'))))
+      .map((f) => f.slice('codex-skills/'.length));
+  } catch {
+    // git が使えない写し（試験など）では、フォルダをたどり、退避・書きかけ・OS のファイルを除く
+    const out = [];
+    const root = path.join(REPO_ROOT, 'codex-skills');
+    const walk = (d, rel) => {
+      for (const x of fs.readdirSync(d, { withFileTypes: true })) {
+        const r = rel ? `${rel}/${x.name}` : x.name;
+        if (x.isDirectory()) walk(path.join(d, x.name), r);
+        else if (!/\.bak-|\.tmp$|^desktop\.ini$|^Thumbs\.db$|^\.DS_Store$/i.test(x.name)) out.push(r);
+      }
+    };
+    if (fs.existsSync(root)) walk(root, '');
+    return out;
+  }
+}
+// frontmatter を1行ずつ読み、壊れた書き方（重複したキー・引用の無い値の中の「: 」・キーの形でない行）を拒否する。
+// 壊れていると Codex がその skill を読み込まないか、別の名前で登録しうる
+function parseSkillFrontmatter(text) {
+  const lines = normLF(text).split('\n');
+  const end = lines[0] === '---' ? lines.indexOf('---', 1) : -1;
+  if (end < 0) return { error: 'frontmatter が無い' };
+  const keys = {};
+  for (const l of lines.slice(1, end)) {
+    if (!l.trim()) continue;
+    const m = l.match(/^([A-Za-z_][A-Za-z0-9_-]*):(?: (.*))?$/);
+    if (!m) return { error: `frontmatter に解釈できない行がある: ${l.slice(0, 40)}` };
+    if (m[1] in keys) return { error: `frontmatter のキーが重複している: ${m[1]}` };
+    const v = (m[2] || '').trim();
+    if (!/^["']/.test(v) && /: /.test(v)) return { error: `frontmatter の ${m[1]} の値に引用の無い「: 」がある（YAML として壊れる）` };
+    keys[m[1]] = v;
+  }
+  return { keys };
+}
+function checkSkills(tree, add) {
+  const dir = path.join(REPO_ROOT, 'codex-skills');
+  if (!fs.existsSync(dir)) return;
+  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (e.isDirectory() && !SKILL_NAME_RE.test(e.name)) add('C13', 'error', `skill の名前が規則（英小文字・数字・-）に合わない: ${e.name}`);
+  }
+  // C14（通常の検査）: 決まったファイル以外があれば、配置されないまま残る（SKILL.md が参照していても届かない）
+  for (const f of skillRepoFiles()) {
+    const [name, ...rest] = f.split('/');
+    if (!rest.length) { add('C14', 'error', `codex-skills/ 直下に skill 以外のファイルがある: ${f}`); continue; }
+    if (!SKILL_FILES.includes(rest.join('/'))) add('C14', 'error', `codex-skills/${f} は配置の対象外（SKILL.md と agents/openai.yaml だけにする）`);
+  }
+  for (const name of managedSkillNames()) {
+    const base = `codex-skills/${name}`;
+    const yaml = tree.read(`${base}/agents/openai.yaml`);
+    if (!yaml) add('C13', 'error', `${base}/agents/openai.yaml が無い（自動の呼び出しが止まらない）`);
+    else if (normLF(yaml.toString('utf8')) !== SKILL_POLICY) {
+      add('C13', 'error', `${base}/agents/openai.yaml が正規の形と違う（期待: policy: の下に allow_implicit_invocation: false だけ）`);
+    }
+    const skill = tree.read(`${base}/SKILL.md`);
+    if (!skill) { add('C13', 'error', `${base}/SKILL.md が無い`); continue; }
+    const fm = parseSkillFrontmatter(skill.toString('utf8'));
+    if (fm.error) { add('C13', 'error', `${base}/SKILL.md の ${fm.error}`); continue; }
+    if (fm.keys.name !== name) add('C13', 'error', `${base}/SKILL.md の name がフォルダ名（${name}）と一致しない`);
+    if (!fm.keys.description) add('C13', 'error', `${base}/SKILL.md に description が無い`);
+  }
 }
 
 // ---- C11/C12: 分類ラベルと設計方針の整合 --------------------------------
 // C1-C9 は「ファイルが在るか」「構成が揃っているか」までしか見ない。
 // 「このコマンドが社内固有に依存するか」は人が決めるものなので、決めた結果が
 // 3箇所(frontmatter / README の分類表 / publish.allowlist)で食い違っていないことを
+// （publish-ref-ok: publish.allowlist 公開用の許可リストは上流の作業リポジトリにだけある。公開物では無いため、照合を省いて警告にする）
 // 機械で見る。人の記憶を担保にしない。
 const SCOPE_VALUES = ['generic', 'org-specific'];
 // docs/command-design.md「2. 採用しているフィールド」と対応する。
@@ -663,7 +785,9 @@ function readAllowlistCommands() {
 
 function checkClassification(tree, add) {
   // listCommands は templates/ 配下も返す。分類の対象は直下の ut-*.md だけ。
-  const names = listCommands(REPO_CMD_DIR).filter(
+  // 分類は Claude のコマンドの性質なので、配置の対象（--target）に関係なく commands/ を見る
+  // （--target が claude 以外のときに、その配置先のフォルダを見て「ut-*.md が無い」と誤って止めていた）
+  const names = TARGETS.claude.listFiles(TARGETS.claude.repoDir).filter(
     (n) => !n.includes('/') && !n.includes(String.fromCharCode(92)) && /^ut-[A-Za-z0-9-]+[.]md$/.test(n)
   );
   if (!names.length) {
@@ -777,13 +901,15 @@ function computePlan() {
   });
 }
 
+const PLAN_LABEL = {
+  unchanged: '一致',
+  differs: '食い違い',
+  'repo-updated': '正本だけ更新（配置先は前回一致した時のまま）',
+  'live-edited': '実行場所だけ変更（正本は前回一致した時のまま）',
+  'repo-only': '正本のみ(未配置)',
+  'live-only': '実行場所のみ(未取込)',
+};
 function printPlan(plan) {
-  const label = {
-    unchanged: '一致',
-    differs: '食い違い',
-    'repo-only': '正本のみ(未配置)',
-    'live-only': '実行場所のみ(未取込)',
-  };
   console.log(`正本      : ${REPO_CMD_DIR}`);
   console.log(`実行場所  : ${LIVE_CMD_DIR}`);
   console.log(`対象      : ${targetName} (${target.description})`);
@@ -794,10 +920,203 @@ function printPlan(plan) {
     return;
   }
   const width = Math.max(...plan.map((p) => p.name.length));
-  for (const p of plan) console.log(`  ${p.name.padEnd(width)}  ${label[p.state]}`);
+  for (const p of plan) console.log(`  ${p.name.padEnd(width)}  ${PLAN_LABEL[p.state]}`);
   console.log('');
   const n = (state) => plan.filter((p) => p.state === state).length;
-  console.log(`一致 ${n('unchanged')} / 食い違い ${n('differs')} / 正本のみ ${n('repo-only')} / 実行場所のみ ${n('live-only')}`);
+  console.log(`一致 ${n('unchanged')} / 食い違い ${n('differs')} / 正本のみ ${n('repo-only')} / 実行場所のみ ${n('live-only')}` +
+    (targetName === 'codex-skills' ? ` / 正本だけ更新 ${n('repo-updated')} / 実行場所だけ変更 ${n('live-edited')}` : ''));
+}
+
+// ---- 試験用の差し込み ------------------------------------------------------
+// ホームとリポジトリの両方に、同じ試験ID（32桁の16進）の印があるときだけ効く。
+// 環境変数が残っていても、本物のホーム・リポジトリには印が無いので効かない（試験は一時的な写しにだけ印を置く）
+const TEST_MARK = '.ut-deploy-test-fixture';
+function testFixtureActive() {
+  const read = (p) => { try { return fs.readFileSync(p, 'utf8').trim(); } catch { return null; } };
+  const h = read(path.join(HOME, TEST_MARK));
+  const r = read(path.join(REPO_ROOT, TEST_MARK));
+  return !!h && /^[0-9a-f]{32}$/.test(h) && h === r;
+}
+const TEST_HOOKS = testFixtureActive();
+const MUTATE_KINDS = ['content', 'create', 'source', 'link'];
+// UT_DEPLOY_MUTATE_BEFORE_WRITE=<書き込み先の相対パス>:<種類>。書く直前に、そのファイルの状態を変える（再確認が止めるかを試す）
+function readMutateHook(writes) {
+  const raw = TEST_HOOKS ? process.env.UT_DEPLOY_MUTATE_BEFORE_WRITE : '';
+  if (!raw) return null;
+  const i = raw.lastIndexOf(':');
+  const rel = i > 0 ? raw.slice(0, i) : '';
+  const kind = i > 0 ? raw.slice(i + 1) : '';
+  if (!MUTATE_KINDS.includes(kind)) fail(`試験用の差し込みの種類が不正: ${kind}`);
+  // 計画の書き込み先との完全一致だけを見る。差し込みは一致したファイルを書く直前にしか動かないため、計画の外（.. や絶対パス）へは
+  // 構造的に届かない。一致の検査は、指定の誤りを黙って無視せずに止めるためにある（差し込まれないまま試験が通るのを防ぐ）
+  if (!writes.some((p) => toPosix(p.name) === rel)) fail(`試験用の差し込みのパスが、今回の書き込み先にありません: ${rel}`);
+  let linkTarget = null;
+  if (kind === 'link') {
+    linkTarget = path.resolve(process.env.UT_DEPLOY_MUTATE_LINK_TARGET || '');
+    const r = path.relative(path.resolve(HOME), linkTarget);
+    if (!process.env.UT_DEPLOY_MUTATE_LINK_TARGET || !r || r.startsWith('..') || path.isAbsolute(r)) {
+      fail(`試験用の差し込みのリンクの先が、ホームの中にありません: ${linkTarget}`);
+    }
+  }
+  console.log(`  試験用の差し込みが効いています: ${rel}:${kind}`);
+  return { rel, kind, linkTarget };
+}
+function applyMutateHook(hook, p, destDir, srcDir) {
+  const MUTATED = Buffer.from('mutated-by-test' + String.fromCharCode(10));
+  if (hook.kind === 'content' || hook.kind === 'create') {
+    const dest = path.join(destDir, p.name);
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.writeFileSync(dest, MUTATED);
+  } else if (hook.kind === 'source') {
+    fs.writeFileSync(path.join(srcDir, p.name), MUTATED);
+  } else if (hook.kind === 'link') {
+    // 書き込み先の skill フォルダを退かし、ジャンクションに差し替える
+    const dir = path.join(destDir, p.name.split(path.sep)[0]);
+    fs.renameSync(dir, dir + '.moved-by-test');
+    fs.symlinkSync(hook.linkTarget, dir, 'junction');
+  }
+}
+
+// ---- codex-skills の配置の安全策 ------------------------------------------
+// 配置先（~/.agents/skills）は他の道具の skill と同居する。ここで扱ってよいのは、このツールが配置したと
+// 管理の記録で分かる skill だけ。名前が同じだけの他者の skill は、--force でも引き取らない。
+// 記録のハッシュは「正本と配置先が最後に一致した時点の中身」。placing（書き込みの途中）と retired（撤去待ち）の
+// 項目は、この意味が崩れている可能性があるため、どちら側が変わったかの判定に使わない
+const SKILL_MANIFEST = path.join(TARGETS['codex-skills'].liveDir, '.ut-commands-managed.json');
+const SKILL_ENTRY_KEYS = ['files', 'at', 'placing', 'retired'];
+function readSkillManifest() {
+  let raw;
+  try { raw = fs.readFileSync(SKILL_MANIFEST, 'utf8'); } catch (e) {
+    if (e.code === 'ENOENT') return { version: 1, skills: {} };
+    throw e;
+  }
+  let m;
+  try { m = JSON.parse(raw); } catch { fail(`管理の記録を JSON として読めません: ${SKILL_MANIFEST}（中身を確かめて直すか、退避してからやり直す）`); }
+  if (!m || !m.skills || typeof m.skills !== 'object' || Array.isArray(m.skills)) fail(`管理の記録の形式が不正です: ${SKILL_MANIFEST}`);
+  if (m.version !== 1) fail(`管理の記録の版が不明です（version=${JSON.stringify(m.version)}）: ${SKILL_MANIFEST}（この版の deploy.mjs は version 1 だけを読む）`);
+  // 中身の形も確かめる。形の崩れた記録を「自分の skill」の証拠として使わない（"ut": "x" でも引き取っていた）
+  for (const [n, v] of Object.entries(m.skills)) {
+    const plain = v && typeof v === 'object' && !Array.isArray(v) && Object.getPrototypeOf(v) === Object.prototype;
+    const okFiles = plain && v.files && typeof v.files === 'object' && !Array.isArray(v.files)
+      && Object.entries(v.files).every(([k, h]) => SKILL_FILES.includes(k) && typeof h === 'string' && /^[0-9a-f]{64}$/.test(h));
+    const okFlags = plain && typeof v.at === 'string' && Object.keys(v).every((k) => SKILL_ENTRY_KEYS.includes(k))
+      && (!Object.hasOwn(v, 'placing') || v.placing === true) && (!Object.hasOwn(v, 'retired') || v.retired === true);
+    if (!SKILL_NAME_RE.test(n) || !okFiles || !okFlags) fail(`管理の記録の ${n} の形式が不正です: ${SKILL_MANIFEST}（中身を確かめて直すか、退避してからやり直す）`);
+  }
+  return m;
+}
+// 配置先の途中にリンク（シンボリックリンク・ジャンクション）があれば、リンクの先へ書かない
+// capture のときはリポジトリ側（codex-skills/）が書き込み先になるため、両方の側を見る
+function findSkillLink(names) {
+  const live = TARGETS['codex-skills'].liveDir;
+  const repo = TARGETS['codex-skills'].repoDir;
+  const paths = [path.dirname(live), live, repo];
+  for (const n of names) paths.push(path.join(live, n), path.join(live, n, 'agents'), path.join(repo, n), path.join(repo, n, 'agents'));
+  for (const p of paths) {
+    let st;
+    try { st = fs.lstatSync(p); } catch { continue; }
+    if (st.isSymbolicLink()) return p;
+  }
+  return null;
+}
+function assertNoSkillLinks(names) {
+  const p = findSkillLink(names);
+  if (p) fail(`配置先の途中にリンクがあります: ${p}（リンクの先へは書かない）`);
+}
+// 配置の前の確認。問題があれば、書き込みを1つも始める前に止める
+function checkSkillLive(plan) {
+  const names = managedSkillNames();
+  const manifest = readSkillManifest();
+  const before = JSON.stringify(manifest);
+  const owned = new Set(Object.keys(manifest.skills));
+  assertNoSkillLinks(names);
+  const live = TARGETS['codex-skills'].liveDir;
+  const problems = [];
+  for (const n of names) {
+    const dir = path.join(live, n);
+    if (fs.existsSync(dir) && !Object.hasOwn(manifest.skills, n)) {
+      problems.push(`${n}: 管理の記録に無い同名の skill が配置先にある（他の道具の skill の可能性。--force でも引き取らない。手で確かめて移すか、名前を変える）`);
+    }
+    const yaml = readIfExists(path.join(dir, 'agents', 'openai.yaml'));
+    if (yaml && normLF(yaml.toString('utf8')) !== SKILL_POLICY) {
+      problems.push(`${n}: 配置先の agents/openai.yaml が正規の形でない（自動の呼び出しが止まっていない可能性。上書きの更新として続けない）`);
+    }
+    if (fs.existsSync(path.join(dir, 'SKILL.md')) && !yaml) {
+      problems.push(`${n}: 配置先に SKILL.md があるのに agents/openai.yaml が無い（自動の呼び出しが止まっていない）`);
+    }
+  }
+  const retired = Object.keys(manifest.skills).filter((n) => !names.includes(n));
+  // 注意（止めはしない）: 途中で止まった配置の名残、記録した内容と配置先の中身の食い違い（手元で変えた可能性）
+  const notes = [];
+  for (const [n, v] of Object.entries(manifest.skills)) {
+    if (v.placing) notes.push(`${n}: 前回の配置が途中で止まっている（どちら側が変わったかの判定に記録を使わない。書き込みが済めば確定する）`);
+    for (const [f, h] of Object.entries(v.files)) {
+      const b = readIfExists(path.join(live, n, ...f.split('/')));
+      if (b && hashOf(b) !== h) notes.push(`${n}/${f}: 配置先の中身が、前回一致したときの記録と違う（手元で変えた可能性。apply すると、この編集は失われる）`);
+    }
+  }
+  // どちら側が変わったかを、記録（R）と正本（S）・配置先（L）のハッシュで分ける
+  for (const p of plan) {
+    if (p.state !== 'differs') continue;
+    const [n, ...rest] = toPosix(p.name).split('/');
+    const f = rest.join('/');
+    const v = Object.hasOwn(manifest.skills, n) ? manifest.skills[n] : null;
+    if (!v || Object.hasOwn(v, 'placing') || Object.hasOwn(v, 'retired') || !Object.hasOwn(v.files, f)) continue;
+    const R = v.files[f];
+    const S = hashOf(p.repoBuf);
+    const L = hashOf(p.liveBuf);
+    if (L === R && S !== R) p.state = 'repo-updated';
+    else if (S === R && L !== R) p.state = 'live-edited';
+  }
+  // names は計画の時点の skill の名前。書く直前のリンクの確認でもこれを使う（その場で数え直すと、ジャンクションに
+  // 差し替えられた skill はフォルダとして数えられず、確認の対象から外れてしまう）
+  return { manifest, before, owned, names, problems, retired, notes, planNames: plan.map((p) => p.name) };
+}
+// 管理の記録を確定する。対象は、実行を始めた時点で記録にあった名前と、今回 placing で所有を始めた名前だけ
+// （記録に無い skill をここで新しく載せない。書き込み0件の capture が、配置していない skill を所有済みにしないため）。
+// 両側が一致するファイルだけを記録し、一致しないものがあれば placing を残す。正本から消えた名前は、
+// 配置先のフォルダが残っていれば retired を付け、フォルダも無ければ項目を外す（所有を手放す）。
+// 中身が変わらなければ書き直さない（at を動かさない）。戻り値は書き直したかどうか
+function finalizeSkillManifest(info) {
+  const m = info.manifest;
+  const live = TARGETS['codex-skills'].liveDir;
+  const repo = TARGETS['codex-skills'].repoDir;
+  const names = managedSkillNames();
+  const now = new Date().toISOString();
+  for (const n of [...info.owned]) {
+    const prev = Object.hasOwn(m.skills, n) ? m.skills[n] : null;
+    if (!names.includes(n)) {
+      if (!fs.existsSync(path.join(live, n))) delete m.skills[n];
+      else if (prev && !prev.retired) m.skills[n] = { ...prev, retired: true, at: now };
+      continue;
+    }
+    const files = {};
+    let complete = true;
+    for (const f of SKILL_FILES) {
+      const b = readIfExists(path.join(live, n, ...f.split('/')));
+      const r = readIfExists(path.join(repo, n, ...f.split('/')));
+      if (b && r && hashOf(b) === hashOf(r)) files[f] = hashOf(b); else complete = false;
+    }
+    const next = { files };
+    if (!complete) {
+      next.placing = true;
+      if (prev && prev.retired) next.retired = true;
+    }
+    const same = prev && JSON.stringify(prev.files) === JSON.stringify(files)
+      && !!prev.placing === !!next.placing && !!prev.retired === !!next.retired;
+    m.skills[n] = { files, at: same ? prev.at : now, ...(next.placing ? { placing: true } : {}), ...(next.retired ? { retired: true } : {}) };
+  }
+  m.version = 1;
+  if (JSON.stringify(m) === info.before) return false;
+  fs.mkdirSync(path.dirname(SKILL_MANIFEST), { recursive: true });
+  writeAtomic(SKILL_MANIFEST, Buffer.from(JSON.stringify(m, null, 2) + '\n'));
+  info.before = JSON.stringify(m);
+  return true;
+}
+function reportSkillLive(info) {
+  for (const p of info.problems) console.log(`  問題: ${p}`);
+  for (const n of info.notes) console.log(`  注意: ${n}`);
+  for (const n of info.retired) console.log(`  撤去待ち: ${n}（管理の記録にあるが、正本の codex-skills/ に無い。撤去は専用の手順で、確認してから行う）`);
 }
 
 function run() {
@@ -811,12 +1130,13 @@ function run() {
     if (skipCheck) {
       // --no-check でも機微値スキャン(C10)だけは必ず実行する。C1-C9 は「壊れたまま急ぎ
       // 配る」判断が成立しうるが、機微値の流出はどんな緊急性でも取り返しがつかない。
-      console.log('警告: 整合性検査をスキップしています(--no-check)。機微値スキャン(C10)は必ず実行します。');
+      console.log('警告: 整合性検査をスキップしています(--no-check)。機微値スキャン(C10)と skills の停止(C13)は必ず実行します。');
       const captureTarget = mode === 'capture' ? targetName : null;
-      const only = runChecks(captureTarget).filter((f) => f.id === 'C10');
-      if (printChecks(only, '機微値スキャン(C10)のみ')) {
+      // C13 も迂回させない。自動の呼び出しが止まっていない skill を配ると、利用者の意図しない起動が起きる
+      const only = runChecks(captureTarget).filter((f) => f.id === 'C10' || f.id === 'C13');
+      if (printChecks(only, '機微値スキャン(C10)・skills の停止(C13)のみ')) {
         console.log('');
-        console.log('ブロック: 機微値の疑いがあります。--no-check では回避できません。');
+        console.log('ブロック: 機微値の疑い、または自動の呼び出しを止めていない skill があります。--no-check では回避できません。');
         return 3;
       }
       console.log('');
@@ -834,13 +1154,27 @@ function run() {
   }
 
   const plan = computePlan();
+  // codex-skills は、表示の前に記録で「どちら側が変わったか」を分ける
+  const skillInfo = targetName === 'codex-skills' ? checkSkillLive(plan) : null;
   printPlan(plan);
+  if (skillInfo) {
+    console.log('');
+    reportSkillLive(skillInfo);
+    if (!skillInfo.problems.length && !skillInfo.retired.length && !skillInfo.notes.length) console.log('  配置先の skills: 問題なし（管理の記録・自動の呼び出しの停止・リンク）');
+    if (skillInfo.problems.length && mode !== 'dry-run') {
+      console.log('');
+      console.log('ブロック: 配置先の skills に問題があります。直してから実行してください（--force でも回避できません）。');
+      return 3;
+    }
+  }
 
   if (mode === 'dry-run') {
     console.log('');
     console.log('(dry-run: 何も書き込んでいません。整合性検査は --check)');
-    const differs = plan.filter((p) => p.state === 'differs');
-    if (differs.length) {
+    const count = (s) => plan.filter((p) => p.state === s).length;
+    if (count('repo-updated')) console.log(`正本だけ更新された ${count('repo-updated')} 件は --force なしで配れます: node tools/deploy.mjs --target ${targetName} --apply`);
+    if (count('live-edited')) console.log(`実行場所だけ変更された ${count('live-edited')} 件は --force なしで取り込めます: node tools/deploy.mjs --target ${targetName} --capture`);
+    if (count('differs')) {
       console.log('食い違いがあります。どちらを正とするか決めてから実行してください:');
       console.log(`  正本を正とする  : node tools/deploy.mjs --target ${targetName} --apply --force`);
       console.log(`  手元編集を正とする: node tools/deploy.mjs --target ${targetName} --capture --force`);
@@ -850,23 +1184,35 @@ function run() {
 
   const toRepo = mode === 'capture';
   const destDir = toRepo ? REPO_CMD_DIR : LIVE_CMD_DIR;
+  const srcDir = toRepo ? LIVE_CMD_DIR : REPO_CMD_DIR;
   const addState = toRepo ? 'live-only' : 'repo-only';
+  // 反対側だけが変わったもの（apply なら repo-updated、capture なら live-edited）は、反対側の編集を失わないので --force が要らない
+  const [safeStates, forcedStates] = toRepo ? [['live-edited'], ['differs', 'repo-updated']] : [['repo-updated'], ['differs', 'live-edited']];
   const srcOf = (p) => (toRepo ? p.liveBuf : p.repoBuf);
+  const destOf = (p) => (toRepo ? p.repoBuf : p.liveBuf);
   const adds = plan.filter((p) => p.state === addState);
-  const overwrites = plan.filter((p) => p.state === 'differs');
+  const safe = plan.filter((p) => safeStates.includes(p.state));
+  const overwrites = plan.filter((p) => forcedStates.includes(p.state));
 
   if (overwrites.length && !force) {
+    const lost = toRepo ? '正本' : '配置先';
     console.log('');
-    console.log(`ブロック: 内容が食い違うファイルが ${overwrites.length} 件あります。`);
-    for (const p of overwrites) console.log(`  - ${p.name}`);
-    console.log(`このまま ${mode} すると反対側の編集が失われます。意図した向きなら --force を付けてください`);
+    console.log(`ブロック: このまま ${mode} すると編集が失われるファイルが ${overwrites.length} 件あります。`);
+    for (const p of overwrites) {
+      const why = p.state === 'differs' ? '両側とも変わっている、または記録が使えない' : `${lost}の新しい編集が失われる`;
+      console.log(`  - ${p.name}（${why}）`);
+    }
+    console.log(`意図した向きなら --force を付けてください`);
     console.log('(上書き前に .bak-<時刻>-<ミリ秒> を残します。同名があれば .1 .2 ... で衝突回避します)。');
     return 1;
   }
 
-  if (!adds.length && !overwrites.length) {
+  const report = (changed) => { if (changed) console.log(`  管理の記録を更新: ${path.basename(SKILL_MANIFEST)}（${Object.keys(skillInfo.manifest.skills).length} 件）`); };
+  if (!adds.length && !safe.length && !overwrites.length) {
     console.log('');
     console.log('作業不要(すべて一致)。');
+    // 書き込みが0件でも記録は確定する（途中で止まった記録の完成、撤去待ちの印、所有を手放した名前の片付け）
+    if (skillInfo) report(finalizeSkillManifest(skillInfo));
     return 0;
   }
 
@@ -874,16 +1220,61 @@ function run() {
   const ts = stamp();
   let added = 0;
   let updated = 0;
+  // skills は、1つの skill の中で openai.yaml を先に、SKILL.md を最後に書く（名前の順に並べると SKILL.md が先になる）
+  // 並べ替えは skill の名前（先頭の要素）ごとにまとめ、その中は fileOrder で決める。同順位は文字コードの順にする
+  // （localeCompare の照合順に頼らない。文字コードの順では SKILL.md が agents/ より先になるため、fileOrder が効いていないと気づける）
+  const seg = (n) => n.split(path.sep)[0];
+  const cp = (x, y) => (x < y ? -1 : x > y ? 1 : 0);
+  const writes = [...adds, ...safe, ...overwrites].sort((a, b) => (seg(a.name) === seg(b.name)
+    ? (fileOrder(a.name) - fileOrder(b.name)) || cp(a.name, b.name)
+    : cp(seg(a.name), seg(b.name))));
+  const failAfter = TEST_HOOKS ? Number(process.env.UT_DEPLOY_FAIL_AFTER || 0) : 0; // 試験用: n 件を書いた直後に止める
+  const hook = readMutateHook(writes);
+  // 書き込み対象を持つすべての skill を、書き込みより先に placing にして保存する（新規も既存も、apply も capture も）。
+  // 途中で止まったとき、書けた側と書けていない側が混ざった状態の記録を「最後に一致した中身」として使わないため
+  if (skillInfo) {
+    const m = skillInfo.manifest;
+    for (const n of new Set(writes.map((p) => seg(p.name)))) {
+      const prev = Object.hasOwn(m.skills, n) ? m.skills[n] : { files: {} };
+      m.skills[n] = { ...prev, at: new Date().toISOString(), placing: true };
+      skillInfo.owned.add(n);
+    }
+    fs.mkdirSync(path.dirname(SKILL_MANIFEST), { recursive: true });
+    writeAtomic(SKILL_MANIFEST, Buffer.from(JSON.stringify(m, null, 2) + '\n'));
+    skillInfo.before = JSON.stringify(m);
+  }
 
-  for (const p of [...adds, ...overwrites]) {
+  for (const p of writes) {
     const dest = path.join(destDir, p.name);
     const buf = srcOf(p);
     if (!buf) fail(`内部エラー: ${p.name} の読み込み元がありません。`);
+    if (hook && toPosix(p.name) === hook.rel) applyMutateHook(hook, p, destDir, srcDir);
+    // 書く直前の再確認。計画を立てた後の通常の変更を検出する（読み直してから置き換えるまでの短い間の変更は防がない。
+    // 複数の deploy の同時実行も想定しない）。外れたら、このファイルから先は書かない。記録は placing のまま残る
+    const stopAt = (why) => {
+      console.log('');
+      console.log(`ブロック: ${p.name} — ${why}。このファイルから先は書いていません（計画を立て直すため、もう一度実行してください）。`);
+      return 1;
+    };
+    const srcNow = readIfExists(path.join(srcDir, p.name));
+    if (!srcNow || hashOf(srcNow) !== hashOf(buf)) return stopAt('計画を立てた後に書き込み元が変わった');
+    const destNow = readIfExists(dest);
+    const destPlan = destOf(p);
+    if (!!destNow !== !!destPlan || (destNow && hashOf(destNow) !== hashOf(destPlan))) return stopAt('計画を立てた後に書き込み先が変わった');
+    if (skillInfo) {
+      const link = findSkillLink(skillInfo.names);
+      if (link) return stopAt(`書き込み先の途中にリンクがある: ${link}（リンクの先へは書かない）`);
+    }
     fs.mkdirSync(path.dirname(dest), { recursive: true });
-    const isOverwrite = fs.existsSync(dest);
+    const isOverwrite = !!destNow;
     const backup = isOverwrite ? uniqueBackupPath(dest, ts) : null;
     if (backup) fs.copyFileSync(dest, backup);
     writeAtomic(dest, buf);
+    // 自動の呼び出しを止める設定は、読み直して正規の形であることを確かめてから次（SKILL.md）へ進む
+    if (skillInfo && !toRepo && toPosix(p.name).endsWith('/agents/openai.yaml')) {
+      const back = readIfExists(dest);
+      if (!back || normLF(back.toString('utf8')) !== SKILL_POLICY) fail(`書き込み後の確認に失敗: ${dest}（SKILL.md は書いていない）`);
+    }
     if (isOverwrite) {
       updated++;
       console.log(`  更新 ${p.name}  (退避: ${path.basename(backup)})`);
@@ -891,7 +1282,11 @@ function run() {
       added++;
       console.log(`  追加 ${p.name}`);
     }
+    if (failAfter && added + updated >= failAfter) fail(`UT_DEPLOY_FAIL_AFTER による中断（${added + updated} 件を書いた直後）`);
   }
+
+  // 両側が一致したファイルを「最後に一致した中身」として記録する（apply も capture も。次回、どちら側が変わったかの判定と、同名の他者の skill との区別に使う）
+  if (skillInfo) report(finalizeSkillManifest(skillInfo));
 
   console.log('');
   console.log(`完了: 追加 ${added} / 更新 ${updated} / 削除 0 (削除は行わない設計)`);

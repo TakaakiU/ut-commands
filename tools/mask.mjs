@@ -63,9 +63,10 @@ function homePatterns() {
   if (user && user.length >= 2) {
     const esc = user.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     // C:\Users\<user> / C:/Users/<user> の両表記
-    out.push({ kind: 'home-path', re: new RegExp('([A-Za-z]:[\\\\/]+Users[\\\\/]+)' + esc, 'g'), to: '$1<USERPROFILE>' });
+    // Windows のパスは大文字小文字を区別しないため、別の表記（C:\USERS\<名前> など）も落とす
+    out.push({ kind: 'home-path', re: new RegExp('([A-Za-z]:[\\\\/]+Users[\\\\/]+)' + esc, 'gi'), to: '$1<USERPROFILE>' });
     // パス以外に出る素の実名も落とす（署名など）
-    out.push({ kind: 'user-name', re: new RegExp(esc, 'g'), to: '<USERPROFILE>' });
+    out.push({ kind: 'user-name', re: new RegExp(esc, 'gi'), to: '<USERPROFILE>' });
   }
   return out;
 }
@@ -94,7 +95,7 @@ export function maskText(input) {
   for (const { kind, re, to } of homePatterns()) {
     text = text.replace(re, (m) => {
       record(kind, m);
-      return to === '$1<USERPROFILE>' ? m.replace(/Users[\\/]+.*$/, (s) => s.replace(/(Users[\\/]+).*/, '$1<USERPROFILE>')) : to;
+      return to === '$1<USERPROFILE>' ? m.replace(/Users[\\/]+.*$/i, (s) => s.replace(/(Users[\\/]+).*/i, '$1<USERPROFILE>')) : to;
     });
   }
 
@@ -149,6 +150,18 @@ function selftest() {
       console.log('       NG 陰性なのに本文が書き換わった');
       fail++;
     }
+  }
+  // 実際のユーザー名の大文字小文字を変えた表記も落とす（Windows では同じパスになる）
+  const user = path.basename(os.homedir());
+  const variant = user.toUpperCase() !== user ? user.toUpperCase() : user.toLowerCase();
+  if (user.length >= 2 && variant !== user) {
+    const input = 'C:\\USERS\\' + variant + '\\work\\a.md';
+    const r = maskText(input);
+    const ok = r.count > 0 && !r.text.toLowerCase().includes(user.toLowerCase()) && r.text.includes('<USERPROFILE>');
+    if (!ok) fail++;
+    console.log((ok ? '  OK   ' : '  NG   ') + '陽性 | ユーザー名の大文字小文字違い | ' + (ok ? '伏せた' : '残った'));
+  } else {
+    console.log('  --   ユーザー名に英字が無いため、大文字小文字違いの確認は対象外');
   }
   console.log('');
   console.log(fail === 0 ? 'selftest: 全件パス' : 'selftest: ' + fail + ' 件失敗');
