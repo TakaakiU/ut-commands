@@ -6,6 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { execFile } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 
 // 生成経路でバックスラッシュが落ちる事故を避けるため、改行は定数で組み立て、正規表現を含む文字列は String.raw で書く
 const NL = String.fromCharCode(10);
@@ -14,7 +15,14 @@ const SRC_PATH = 'tools/ut-env.mjs';
 const SRC = fs.readFileSync(SRC_PATH, 'utf8');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ute-sweep-'));
 // 変異版から相対 import する mask.mjs を横に置く
-fs.copyFileSync('tools/mask.mjs', path.join(tmp, 'mask.mjs'));
+// mask.mjs は ../commands/templates/ut-review.mjs を相対 import するため、写しの置き場所では解決できない。repo の実ファイルを指す絶対 URL に書き換える
+{
+  const reviewUrl = pathToFileURL(path.resolve('commands/templates/ut-review.mjs')).href;
+  const maskSrc = fs.readFileSync('tools/mask.mjs', 'utf8');
+  const rewritten = maskSrc.replace("'../commands/templates/ut-review.mjs'", JSON.stringify(reviewUrl));
+  if (rewritten === maskSrc) { console.log('mask.mjs の import を書き換えられない（形が変わった）'); process.exit(1); }
+  fs.writeFileSync(path.join(tmp, 'mask.mjs'), rewritten);
+}
 
 // expect: その防御を見ているテスト名の一部。これで落ちた場合だけ CAUGHT と数える
 const mutations = [
@@ -88,8 +96,8 @@ const mutations = [
   { id: 'E54', desc: '環境変数の値を表示する', expect: '秘密の値・メール・テナントIDを出さない',
     find: "message: '現在のプロセスに設定あり（値は表示しない。値が有効かは未確認）'", to: 'message: process.env[name]' },
   { id: 'E55', desc: 'Backlog の例外文（キー入り URL）を返し、親の選別も外す', expect: '通信の子プロセスがキーを返さない',
-    find: "console.log(JSON.stringify({ err: (e && e.cause && e.cause.code) || (e && e.name) || 'Error' }));", to: 'console.log(JSON.stringify({ err: String(e && e.message) + " " + u }));',
-    also: ["const safeErr = typeof o.err === 'string' && /^[A-Za-z_]+$/.test(o.err) ? o.err : 'Error';", 'const safeErr = o.err;'] },
+    find: "{ code: r.status })); process.exit(0); })\n  .catch((e) => { console.log(JSON.stringify({ err: (e && e.cause && e.cause.code) || (e && e.name) || 'Error' }));", to: '{ code: r.status })); process.exit(0); })\n  .catch((e) => { console.log(JSON.stringify({ err: String(e && e.message) + " " + u }));',
+    also: ["const safeErr = typeof o.err === 'string' && /^[A-Za-z_]+$/.test(o.err) ? o.err : 'Error';\n  return { ok: Number.isInteger(o.code) && o.code >= 200", 'const safeErr = o.err;\n  return { ok: Number.isInteger(o.code) && o.code >= 200'] },
   { id: 'E56', desc: 'fail があっても終了コード0', expect: 'fail のときだけ終了コード1',
     find: 'return d.totals.fail ? 1 : 0;', to: 'return 0;' },
   { id: 'E57', desc: 'fail を総数に数えない', expect: '総数 = ok + warn + fail',
@@ -187,7 +195,7 @@ const mutations = [
   { id: 'E112', desc: '通信の子プロセスへ環境を丸ごと渡す', expect: 'NODE_OPTIONS やプロキシの変数を渡さない',
     find: "  for (const k of CHILD_ENV_KEYS) if (process.env[k] !== undefined) e[k] = process.env[k];\n  return { ...e, ...extra };", to: "  return { ...process.env, ...extra };" },
   { id: 'E113', desc: 'リダイレクトをたどる', expect: 'リダイレクトをたどらない',
-    find: "redirect: 'manual'", to: "redirect: 'follow'" },
+    find: "fetch(u, { signal: ac.signal, redirect: 'manual' })", to: "fetch(u, { signal: ac.signal, redirect: 'follow' })" },
   { id: 'E115', desc: 'キーを profile の変数名のまま子の環境に入れる', expect: 'キーの変数名が NODE_OPTIONS などでも',
     find: "  const keyVar = keyEnv ? { UT_ENV_API_KEY: process.env[keyEnv] || '', UT_ENV_HAS_KEY: '1' } : {};", to: "  const keyVar = keyEnv ? { [keyEnv]: process.env[keyEnv] || '', UT_ENV_API_KEY: process.env[keyEnv] || '', UT_ENV_HAS_KEY: '1' } : {};" },
   { id: 'E116', desc: 'backlog.env に起動に使う変数の名前を許す', expect: '起動に使う変数・内部の変数の名前を使わせない',
@@ -200,6 +208,92 @@ const mutations = [
     find: '    const mutateTarget = testHooks.mutateTarget;', to: "    const mutateTarget = testHooks.mutateTarget || process.env.UT_ENV_MUTATE_TARGET || '';" },
   { id: 'E120', desc: '外部コマンドのスタブを環境変数でも差し替えられる', expect: '試験用の差し込みは環境変数では効かない',
     find: '  const stub = testHooks.cmdStubs[name.toLowerCase()];', to: '  const stub = testHooks.cmdStubs[name.toLowerCase()] || process.env[`UT_ENV_CMD_${name.toUpperCase()}`];' },
+  { id: 'E121', desc: 'New Relic のリージョンを存在確認なしで通す（__proto__ などが通る）', expect: 'リージョンは us / eu だけ',
+    find: "  if (!Object.hasOwn(NERDGRAPH_HOSTS, region)) return { ok: false, code: null, err: 'destination_refused'", to: "  if (false) return { ok: false, code: null, err: 'destination_refused'" },
+  { id: 'E122', desc: 'New Relic の応答の errors を見ずに HTTP 200 を成功とする', expect: 'HTTP 200 でも errors があれば',
+    find: "code2 < 300 && !gqlErrors && accounts !== null && accounts > 0", to: "code2 < 300 && accounts !== null && accounts > 0" },
+  { id: 'E123', desc: 'New Relic のアカウントが 0 件でも成功とする', expect: 'HTTP 200 でも errors があれば',
+    find: "code2 < 300 && !gqlErrors && accounts !== null && accounts > 0", to: "code2 < 300 && !gqlErrors" },
+  { id: 'E124', desc: 'New Relic のキーを URL のクエリに付ける', expect: 'キーは固定のホストへ POST し',
+    find: "env: childEnv({ UT_ENV_API_KEY: process.env[keyEnv] || '', UT_ENV_URL: url }),", to: "env: childEnv({ UT_ENV_API_KEY: process.env[keyEnv] || '', UT_ENV_URL: url + '?apiKey=' + (process.env[keyEnv] || '') }),", },
+  { id: 'E125', desc: 'newrelic.env に起動に使う変数の名前を許す', expect: '起動に使う変数・内部の変数の名前を使わせない',
+    find: "    if (CHILD_ENV_KEYS.some((k) => k.toLowerCase() === n.env.toLowerCase()) || /^UT_ENV_/i.test(n.env)) throw new ConfigError(", to: "    if (false) throw new ConfigError(" },
+  { id: 'E126', desc: 'New Relic の点検名を期待する点検から外す', expect: '点検名の登録漏れが無い',
+    find: "    e.push('New Relic API（NerdGraph）');", to: "" },
+  { id: 'E141', desc: '前回との差で、状態が変わった点検を数えない', expect: '前回の結果との差を出す',
+    find: "else if (last.checks.get(k) !== v) changes.push(", to: "else if (false) changes.push(" },
+  { id: 'E142', desc: '前回にあって今回は消えた点検を無視する', expect: '前回の結果との差を出す',
+    find: "for (const [k, v] of last.checks) if (!now.has(k)) changes.push(", to: "for (const [k, v] of []) if (!now.has(k)) changes.push(" },
+  { id: 'E143', desc: '壊れた前回の記録を「記録なし」として黙って扱う', expect: '前回の結果との差を出す',
+    find: "  } catch { return { state: 'broken' }; }", to: "  } catch { return { state: 'none' }; }" },
+  { id: 'E145', desc: '前回の記録に点検の結果（メッセージ）まで残す', expect: '前回の結果との差を出す',
+    find: "JSON.stringify({ at: new Date().toISOString(), online, checks }, null, 2)", to: "JSON.stringify({ at: new Date().toISOString(), online, checks, results: d.results }, null, 2)" },
+  { id: 'E146', desc: '前回の記録を保存できなかったことを黙って成功にする', expect: '前回の結果との差を出す',
+    find: "  } catch (e) { return String(e && e.code || 'error'); }", to: "  } catch (e) { return null; }" },
+  { id: 'E147', desc: '前回の記録を対象ツリーごとに分けない', expect: '前回の結果との差を出す',
+    find: "const scope = target ? 'tree-'", to: "const scope = false ? 'tree-'" },
+  { id: 'E148', desc: '--online の有無が違うことを添えない', expect: '前回の結果との差を出す',
+    find: "if (df.lastOnline !== df.online) L.push(", to: "if (false) L.push(" },
+  { id: 'E149', desc: '確かめていない（unknown）点検にも依頼を出す', expect: '頼む一覧は fail・warn の点検',
+    find: "(r.status === 'fail' || r.status === 'warn'));", to: "r.status !== 'ok');" },
+  { id: 'E150', desc: 'warn の点検には依頼を出さない', expect: '頼む一覧は fail・warn の点検',
+    find: "(r.status === 'fail' || r.status === 'warn'));", to: "r.status === 'fail');" },
+  { id: 'E151', desc: 'requests が指す点検名の実在を確かめない', expect: '頼む一覧は fail・warn の点検',
+    find: "requests.forEach((r, i) => { for (const c of r.checks) if (!known.has(c)) throw", to: "requests.forEach((r, i) => { for (const c of r.checks) if (false) throw" },
+  { id: 'E152', desc: 'priorities が指す点検名の実在を確かめない', expect: '頼む一覧は fail・warn の点検',
+    find: "for (const k of Object.keys(priorities)) if (!known.has(k)) throw", to: "for (const k of Object.keys(priorities)) if (false) throw" },
+  { id: 'E153', desc: 'requests の checks が空でも受け付ける', expect: '頼む一覧は fail・warn の点検',
+    find: "if (!checks.length) throw new ConfigError(`profile の requests[", to: "if (false) throw new ConfigError(`profile の requests[" },
+  { id: 'E154', desc: '依頼文の長さの上限を見ない', expect: '頼む一覧は fail・warn の点検',
+    find: " || v.length > 500 || /[", to: " || /[" },
+  { id: 'E155', desc: 'priorities を原型のある入れ物にする（__proto__ が黙って捨てられる）', expect: '優先度は点検名から決まり',
+    find: "const priorities = Object.create(null);", to: "const priorities = {};" },
+  { id: 'E156', desc: 'requests の項目の制御文字（改行）を許す', expect: '頼む一覧は fail・warn の点検',
+    find: "|| /[\\u0000-\\u001f\\u007f]/.test(v)) throw new ConfigError(`profile の requests[", to: ") throw new ConfigError(`profile の requests[" },
+  { id: 'E157', desc: '前回の記録の種別・大きさを見ずに読む', expect: '前回の結果との差を出す',
+    find: "if (!st.isFile() || st.size > LAST_MAX_BYTES) throw new Error('種別・大きさ');", to: "" },
+  { id: 'E158', desc: '前回の記録の online が真偽値でなくても受け付ける', expect: '前回の結果との差を出す',
+    find: " || typeof o.online !== 'boolean') throw new Error('形式');", to: ") throw new Error('形式');" },
+  { id: 'E159', desc: '前回の記録の at が日時の形でなくても受け付ける', expect: '前回の結果との差を出す',
+    find: " || !/^\\d{4}-\\d\\d-\\d\\dT[\\d:.]+Z$/.test(o.at)", to: "" },
+  { id: 'E160', desc: '前回の記録の点検数に上限を設けない', expect: '前回の結果との差を出す',
+    find: " || Object.keys(o.checks).length > LAST_MAX_CHECKS", to: "" },
+  { id: 'E161', desc: '前回の記録の点検名の長さ・制御文字を見ない', expect: '前回の結果との差を出す',
+    find: " || k.length > LAST_MAX_NAME || /[\\u0000-\\u001f\\u007f]/.test(k)", to: "" },
+  { id: 'E162', desc: '同名の点検の状態を実行順のまま比べる（並べ替えない）', expect: '前回の結果との差を出す',
+    find: "[k, v.sort().join(',')]", to: "[k, v.join(',')]" },
+  { id: 'E163', desc: 'unknown があれば終了コードを 1 にする', expect: '終了コードは fail だけが 1',
+    find: "return d.totals.fail ? 1 : 0;", to: "return d.totals.fail || d.totals.unknown ? 1 : 0;" },
+  { id: 'E164', desc: '前回の記録の状態値を、文字列なら何でも受け付ける', expect: '前回の結果との差を出す',
+    find: "const validStatus = (v) => typeof v === 'string' && v.split(',').every((x) => STATUSES.includes(x));", to: "const validStatus = (v) => typeof v === 'string';" },
+  { id: 'E133', desc: '--online なしで通信しない点検を結果から消す（unknown で残さない）', expect: '通信する点検を --online なしで省いたときは unknown',
+    find: "if (!online) results.push(notRun('New Relic API（NerdGraph）'));", to: "if (!online) { /* 何も残さない */ }" },
+  { id: 'E134', desc: '未実施の点検を ok として残す', expect: '通信する点検を --online なしで省いたときは unknown',
+    find: "status: 'unknown', message: '--online を付けていない", to: "status: 'ok', message: '--online を付けていない" },
+  { id: 'E135', desc: 'unknown を合計から数えない', expect: '総数 = ok + warn + fail',
+    find: "    totals[r.status]++;\n    byPriority", to: "    if (r.status !== 'unknown') totals[r.status]++;\n    byPriority" },
+  { id: 'E136', desc: 'A に unknown があっても完了とする', expect: '優先度は点検名から決まり',
+    find: "a.warn + a.fail + a.unknown === 0;", to: "a.warn + a.fail === 0;" },
+  { id: 'E137', desc: 'A が 0 件でも完了とする', expect: '優先度は点検名から決まり',
+    find: "const setupComplete = a.ok > 0 && ", to: "const setupComplete = " },
+  { id: 'E138', desc: 'profile の priorities の値を検査しない', expect: '優先度は点検名から決まり',
+    find: "if (!k || !['A', 'B', 'C'].includes(v)) throw", to: "if (false) throw" },
+  { id: 'E139', desc: 'profile の priorities による上書きを効かせない', expect: '優先度は点検名から決まり',
+    find: "if (overrides && Object.hasOwn(overrides, check)) return overrides[check];", to: "" },
+  { id: 'E140', desc: '環境変数の優先度を B にする', expect: '優先度は点検名から決まり',
+    find: "['A', /^(環境変数 |", to: "['B', /^(環境変数 |" },
+  { id: 'E127', desc: '子が返した件数の型を確かめずに使う', expect: '子の出力はキーや想定外の値を信用しない',
+    find: "const accounts = Number.isSafeInteger(o.accounts) && o.accounts >= 0 && o.accounts <= 0xffffffff ? o.accounts : null;", to: "const accounts = o.accounts === undefined ? null : o.accounts;" },
+  { id: 'E128', desc: 'errors を配列のときだけ失敗とする（オブジェクト・文字列は成功扱い）', expect: '応答本文の判定は errors が「ある」だけで失敗にする',
+    find: "Object.hasOwn(j, 'errors') && j.errors !== null && !(Array.isArray(j.errors) && j.errors.length === 0);", to: "Array.isArray(j.errors) && j.errors.length > 0;" },
+  { id: 'E129', desc: '子の出力の gqlErrors の欠落・型違いを「errors なし」と読む', expect: 'HTTP 200 でも errors があれば',
+    find: "const shapeOk = code2 === null || (typeof o.gqlErrors === 'boolean' && typeof o.json === 'boolean');", to: "const shapeOk = true;" },
+  { id: 'E130', desc: '子の err を文字種だけで信用する', expect: '子の出力はキーや想定外の値を信用しない',
+    find: "typeof o.err === 'string' && NERDGRAPH_KNOWN_ERRORS.has(o.err) ? o.err : 'Error';", to: "typeof o.err === 'string' && /^[A-Za-z_]+$/.test(o.err) ? o.err : 'Error';" },
+  { id: 'E131', desc: '件数・ステータスの範囲を見ない（巨大な数を通す）', expect: 'HTTP 200 でも errors があれば',
+    find: "const accounts = Number.isSafeInteger(o.accounts) && o.accounts >= 0 && o.accounts <= 0xffffffff ? o.accounts : null;", to: "const accounts = Number.isInteger(o.accounts) && o.accounts >= 0 ? o.accounts : null;" },
+  { id: 'E132', desc: 'JSON でない本文を成功の判定に含めない', expect: 'HTTP 200 でも errors があれば',
+    find: "return { ok: shapeOk && jsonOk && code2 !== null", to: "return { ok: shapeOk && code2 !== null" },
   { id: 'E114', desc: 'profile の backlog.space を形だけで受け付ける', expect: 'profile の backlog.space は公式ドメインの形だけを受け付ける',
     find: "space: typeof b.space === 'string' && isBacklogHost(b.space) ? b.space.toLowerCase() : null,", to: "space: typeof b.space === 'string' && /^[A-Za-z0-9.-]+$/.test(b.space) ? b.space.toLowerCase() : null," },
   { id: "E99", desc: "点検漏れの報告を止め、点検の登録も1つ外す", expect: "期待する点検がすべて実施される",

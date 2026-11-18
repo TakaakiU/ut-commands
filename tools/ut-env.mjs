@@ -143,17 +143,53 @@ export function loadProfile(file = profilePath()) {
     };
   }
   if (p.backlog?.space !== undefined && !backlog.space) throw new ConfigError('profile の backlog.space は Backlog の公式ドメインのホスト名（<スペース>.backlog.jp / .backlog.com / .backlogtool.com）にする');
+  let newrelic = null;
+  if (p.newrelic !== undefined) {
+    const n = p.newrelic;
+    if (!n || typeof n !== 'object') throw new ConfigError('profile の newrelic はオブジェクトにする');
+    if (typeof n.env !== 'string' || !ENV_NAME.test(n.env)) throw new ConfigError('profile の newrelic.env は環境変数名にする');
+    if (CHILD_ENV_KEYS.some((k) => k.toLowerCase() === n.env.toLowerCase()) || /^UT_ENV_/i.test(n.env)) throw new ConfigError(`profile の newrelic.env に ${n.env} は使えない（通信の子プロセスの起動に使う変数・内部の変数と重なる）`);
+    if (n.region !== undefined && !Object.hasOwn(NERDGRAPH_HOSTS, n.region)) throw new ConfigError('profile の newrelic.region は us か eu にする');
+    newrelic = { env: n.env, region: n.region === undefined ? 'us' : n.region };
+  }
   let sonarqube = null;
   if (p.sonarqube !== undefined) {
     if (!p.sonarqube || typeof p.sonarqube.url_env !== 'string' || !ENV_NAME.test(p.sonarqube.url_env)) throw new ConfigError('profile の sonarqube.url_env は環境変数名にする');
     sonarqube = { url_env: p.sonarqube.url_env };
+  }
+  // 点検名ごとの優先度の指定（A/B/C）。点検名は表示用の文字列なので、値だけを厳密に検査する
+  // 原型を持たない入れ物にする。通常のオブジェクトだと、キー "__proto__" への代入が黙って捨てられ、検証をすり抜けて「設定した」ことになる
+  const priorities = Object.create(null);
+  if (p.priorities !== undefined) {
+    if (!p.priorities || typeof p.priorities !== 'object' || Array.isArray(p.priorities)) throw new ConfigError('profile の priorities は {点検名: "A"|"B"|"C"} にする');
+    for (const [k, v] of Object.entries(p.priorities)) {
+      if (!k || !['A', 'B', 'C'].includes(v)) throw new ConfigError(`profile の priorities.${k} は A・B・C のどれかにする`);
+      priorities[k] = v;
+    }
+  }
+  // 「頼む一覧」の定義。点検が fail・warn のとき、頼み先ごとに依頼文などを示す（文面は利用者が書く。コードに固有の名前を持たない）
+  const requests = [];
+  if (p.requests !== undefined) {
+    if (!Array.isArray(p.requests)) throw new ConfigError('profile の requests は [{to, checks, ask, issue, place}] の配列にする');
+    const text = (v, n, i, req) => {
+      if (v === undefined && !req) return '';
+      // 改行などの制御文字を許すと、出力に「セットアップ: 完了」のような偽の行を混ぜられる。1 項目は 1 行にする
+      if (typeof v !== 'string' || !v.trim() || v.length > 500 || /[\u0000-\u001f\u007f]/.test(v)) throw new ConfigError(`profile の requests[${i}].${n} は 1〜500 文字の 1 行の文字列にする（改行・制御文字は使えない）`);
+      return v;
+    };
+    p.requests.forEach((r, i) => {
+      if (!r || typeof r !== 'object' || Array.isArray(r)) throw new ConfigError(`profile の requests[${i}] はオブジェクトにする`);
+      const checks = strArray(r.checks, `requests[${i}].checks`);
+      if (!checks.length) throw new ConfigError(`profile の requests[${i}].checks は点検名を 1 つ以上書く`);
+      requests.push({ to: text(r.to, 'to', i, true), checks, ask: text(r.ask, 'ask', i, true), issue: text(r.issue, 'issue', i, false), place: text(r.place, 'place', i, false) });
+    });
   }
   const bool = (v, n) => {
     if (v === undefined) return false;
     if (typeof v !== 'boolean') throw new ConfigError(`profile の ${n} は true/false にする`);
     return v;
   };
-  return {
+  const prof = {
     source: p.source,
     sets,
     env: strArray(p.env, 'env', ENV_NAME),
@@ -168,10 +204,19 @@ export function loadProfile(file = profilePath()) {
     required: strArray(p.required, 'required').map((x) => relPattern(x, 'required')),
     config_json: configJson,
     backlog,
+    newrelic,
     sonarqube,
+    priorities,
+    requests,
     vscode: bool(p.vscode, 'vscode'),
     tools: { claude: bool(p.tools?.claude, 'tools.claude'), codex: bool(p.tools?.codex, 'tools.codex'), az: bool(p.tools?.az, 'tools.az'), ut_defer: bool(p.tools?.ut_defer, 'tools.ut_defer') },
   };
+  // priorities と requests が指す点検名は、この profile で実際に行われる点検の名前でなければならない。
+  // 綴りの誤りを黙って受け付けると、上げ下げも依頼の表示も一度も効かないまま「設定した」ことになる（検出できない失敗になる）
+  const known = new Set([...expectedChecks(prof, { target: '<tree>' }), '警告']);
+  for (const k of Object.keys(priorities)) if (!known.has(k)) throw new ConfigError(`profile の priorities の点検名「${k}」は、この profile で行われる点検に無い`);
+  requests.forEach((r, i) => { for (const c of r.checks) if (!known.has(c)) throw new ConfigError(`profile の requests[${i}].checks の点検名「${c}」は、この profile で行われる点検に無い`); });
+  return prof;
 }
 
 // ---------------------------------------------------------------- 外部コマンド
@@ -621,7 +666,23 @@ export function applyTree(profile, target, opts = {}) {
 
 // ---------------------------------------------------------------- doctor
 
-const STATUS_MARK = { ok: '✓', warn: '!', fail: '✗' };
+const STATUS_MARK = { ok: '✓', warn: '!', fail: '✗', unknown: '?' };
+
+// 通信する点検を --online なしで実行しなかったとき。点検が「無かったこと」にならないよう、未確認として結果に残す。
+// unknown は ok に数えず、終了コードも変えない（fail だけが 1）。「確認できていない」と「問題がない」を混ぜないための状態
+const notRun = (check) => ({ area: 'machine', check, status: 'unknown', message: '--online を付けていないので通信していない（未確認）', fix: '確かめるときは doctor --online', evidence: '' });
+
+// 点検の優先度。A=これが無いと作業を始められない／B=一部の機能が使えない／C=あれば便利。
+// 既定は点検名から決め、profile の priorities で点検名ごとに上書きできる。どれにも当たらない名前は B
+const PRIORITY_RULES = [
+  ['A', /^(環境変数 |セット |秘密ファイル |個人設定 |必須ファイル )/], ['A', /^(Claude Code|ツリー|exclude|点検|点検漏れ|点検の重複・想定外)$/],
+  ['C', /^(VS Code のデバッグ設定|Backlog の同期データ|警告)$/],
+];
+export function priorityOf(check, overrides) {
+  if (overrides && Object.hasOwn(overrides, check)) return overrides[check];
+  for (const [p, re] of PRIORITY_RULES) if (re.test(check)) return p;
+  return 'B';
+}
 
 // 1つの点検の失敗（例外・外部コマンドの不在・出力形式の変化）を、その点検の fail に閉じ込める
 async function runCheck(results, area, name, fn) {
@@ -729,7 +790,8 @@ async function machineChecks(profile, results, { online }) {
       return h <= b.max_age_hours ? { status: 'ok', message: `${h.toFixed(1)} 時間前に更新（同期が成功したかは未確認）`, evidence: `${b.data} の更新時刻` }
         : { status: 'warn', message: `${h.toFixed(1)} 時間前から更新なし（基準 ${b.max_age_hours} 時間）`, fix: b.sync_script ? `python "${b.sync_script}"` : '同期する', evidence: `${b.data} の更新時刻` };
     });
-    if (online) await runCheck(results, 'machine', 'Backlog API（読み取り）', () => {
+    if (!online) results.push(notRun('Backlog API（読み取り）'));
+    else await runCheck(results, 'machine', 'Backlog API（読み取り）', () => {
       if (!b.space) return { status: 'warn', message: 'profile に backlog.space が無いため確認しない' };
       const url = `https://${b.space}/api/v2/users/myself`;
       const st = onlineStatus(url, b.env);
@@ -738,6 +800,24 @@ async function machineChecks(profile, results, { online }) {
         : { status: 'fail', message: st.code ? `HTTP ${st.code}` : `接続できない（${st.err}）`, fix: 'キーの有効性とネットワークを確かめる', evidence: 'GET /users/myself（ステータスだけ）' };
     });
   }
+  if (profile.newrelic) {
+    const n = profile.newrelic;
+    await runCheck(results, 'machine', `環境変数 ${n.env}`, () => envCheck(n.env));
+    if (!online) results.push(notRun('New Relic API（NerdGraph）'));
+    else await runCheck(results, 'machine', 'New Relic API（NerdGraph）', () => {
+      const st = nerdgraphStatus(n.region, n.env);
+      const where = `送り先 ${NERDGRAPH_HOSTS[n.region]}`;
+      const ev = 'POST /graphql（actor.accounts の件数だけ）';
+      if (st.err === 'destination_refused') return { status: 'fail', message: `送り先を拒否した（${st.why}）。キーは送っていない`, evidence: '送る前の送り先の検査' };
+      if (st.ok) return { status: 'ok', message: `HTTP ${st.code}・アクセスできるアカウント ${st.accounts} 件（${where}）`, evidence: ev };
+      if (st.code !== null && !st.shapeOk) return { status: 'fail', message: `応答の形が不正（子プロセスの出力が想定と違う。${where}）`, fix: '再実行しても続くなら ut-env.mjs の不具合として報告する', evidence: ev };
+      if (st.code === 200 && !st.jsonOk) return { status: 'fail', message: `HTTP 200 だが応答が JSON として読めない（途中の機器・リージョンの誤りの可能性。${where}）`, fix: 'リージョン（us / eu）とネットワークの経路を確かめる', evidence: ev };
+      if (st.code === 200 && st.gqlErrors) return { status: 'fail', message: `HTTP 200 だが応答に errors がある（キーの種別・権限・リージョンを確かめる。${where}）`, fix: 'ユーザーキー（NRAK-）か、リージョン（us / eu）が合っているかを確かめる', evidence: ev };
+      if (st.code === 200) return { status: 'fail', message: `HTTP 200 だがアカウントを 1 件も取得できない（権限が無い可能性。${where}）`, fix: 'キーの権限（アカウントへのアクセス）を確かめる', evidence: ev };
+      return { status: 'fail', message: st.code ? `HTTP ${st.code}` : `接続できない（${st.err}）`, fix: 'キーの有効性とネットワークを確かめる', evidence: ev };
+    });
+  }
+  if (profile.sonarqube && !online) results.push(notRun('SonarQube の疎通'));
   if (profile.sonarqube && online) await runCheck(results, 'machine', 'SonarQube の疎通', () => {
     const base = process.env[profile.sonarqube.url_env];
     if (!base) return { status: 'fail', message: `${profile.sonarqube.url_env} が未設定のため確認できない` };
@@ -809,6 +889,51 @@ fetch(u, { signal: ac.signal, redirect: 'manual' })
   try { o = JSON.parse((r.stdout || '').trim().split('\n').pop()); } catch { o = { err: r.error ? r.error.code || 'spawn' : 'no-output' }; }
   const safeErr = typeof o.err === 'string' && /^[A-Za-z_]+$/.test(o.err) ? o.err : 'Error';
   return { ok: Number.isInteger(o.code) && o.code >= 200 && o.code < 300, code: Number.isInteger(o.code) ? o.code : null, err: safeErr };
+}
+
+// New Relic の NerdGraph。送り先はリージョンごとの固定のホストだけ（profile から URL を受け取らない）。
+// キーはヘッダー（API-Key）で付け、URL・argv・出力・例外文に出さない。NerdGraph は失敗でも HTTP 200 で errors を返すことがあるため、
+// 本文の errors と取得したアカウント数まで見て成否を決める（件数だけを返し、アカウント ID や名前は子から出さない）
+const NERDGRAPH_KNOWN_ERRORS = new Set(['AbortError', 'TimeoutError', 'TypeError', 'Error', 'ECONNREFUSED', 'ECONNRESET', 'ENOTFOUND', 'ETIMEDOUT', 'EAI_AGAIN', 'ENETUNREACH', 'EHOSTUNREACH', 'UND_ERR_CONNECT_TIMEOUT', 'CERT_HAS_EXPIRED', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE', 'SELF_SIGNED_CERT_IN_CHAIN', 'DEPTH_ZERO_SELF_SIGNED_CERT', 'spawn', 'ENOENT', 'no-output']);
+// 応答本文の判定（子プロセスの中でも同じ関数を使う。toString で埋め込むため、外の変数を参照しない）。
+// errors は、あるだけで失敗にする（空の配列だけは無いものとして扱う。配列以外の型・null 以外の値も失敗）
+export function nerdgraphBody(j) {
+  const isObj = !!j && typeof j === 'object' && !Array.isArray(j);
+  const list = isObj && j.data && j.data.actor && Array.isArray(j.data.actor.accounts) ? j.data.actor.accounts : null;
+  const hasErrors = isObj && Object.hasOwn(j, 'errors') && j.errors !== null && !(Array.isArray(j.errors) && j.errors.length === 0);
+  return { json: isObj, gqlErrors: hasErrors, accounts: list ? list.length : null };
+}
+export const NERDGRAPH_HOSTS = { us: 'api.newrelic.com', eu: 'api.eu.newrelic.com' };
+export function nerdgraphStatus(region, keyEnv) {
+  if (!Object.hasOwn(NERDGRAPH_HOSTS, region)) return { ok: false, code: null, err: 'destination_refused', why: 'リージョンが us / eu ではない' };
+  const url = `https://${NERDGRAPH_HOSTS[region]}/graphql`;
+  const code = `
+${nerdgraphBody.toString()}
+const ac = new AbortController(); setTimeout(() => ac.abort(), 15000);
+fetch(process.env.UT_ENV_URL, { method: 'POST', signal: ac.signal, redirect: 'manual',
+  headers: { 'Content-Type': 'application/json', 'API-Key': process.env.UT_ENV_API_KEY || '' },
+  body: JSON.stringify({ query: '{ actor { accounts { id } } }' }) })
+  .then(async (r) => {
+    let j = null; try { j = await r.json(); } catch { /* 本文が JSON でない */ }
+    console.log(JSON.stringify({ code: r.status, ...nerdgraphBody(j) })); process.exit(0); })
+  .catch((e) => { console.log(JSON.stringify({ err: (e && e.cause && e.cause.code) || (e && e.name) || 'Error' })); process.exit(0); });`;
+  const [maj, min] = process.versions.node.split('.').map(Number);
+  const sysCa = maj > 23 || (maj === 23 && min >= 8) || (maj === 22 && min >= 15);
+  const r = net.run(process.execPath, [...(sysCa ? ['--use-system-ca'] : []), '-e', code], {
+    encoding: 'utf8', timeout: 30000, windowsHide: true,
+    env: childEnv({ UT_ENV_API_KEY: process.env[keyEnv] || '', UT_ENV_URL: url }),
+  });
+  let o = {};
+  try { o = JSON.parse((r.stdout || '').trim().split('\n').pop()); } catch { o = { err: r.error ? r.error.code || 'spawn' : 'no-output' }; }
+  // 子の出力は信用しない。err は既知の型・コードだけ（それ以外は Error）、件数・ステータスは範囲のある整数、真偽の欄は厳密な boolean だけ。
+  // 形が合わない出力は「応答の形が不正」として失敗にする（欠けた欄を「errors なし」と読まない）
+  const safeErr = typeof o.err === 'string' && NERDGRAPH_KNOWN_ERRORS.has(o.err) ? o.err : 'Error';
+  const code2 = Number.isSafeInteger(o.code) && o.code >= 100 && o.code <= 599 ? o.code : null;
+  const accounts = Number.isSafeInteger(o.accounts) && o.accounts >= 0 && o.accounts <= 0xffffffff ? o.accounts : null;
+  const shapeOk = code2 === null || (typeof o.gqlErrors === 'boolean' && typeof o.json === 'boolean');
+  const jsonOk = o.json === true;
+  const gqlErrors = o.gqlErrors === true;
+  return { ok: shapeOk && jsonOk && code2 !== null && code2 >= 200 && code2 < 300 && !gqlErrors && accounts !== null && accounts > 0, code: code2, err: safeErr, gqlErrors, accounts, shapeOk, jsonOk };
 }
 
 async function targetChecks(profile, target, results) {
@@ -895,9 +1020,13 @@ export function expectedChecks(profile, { target = null, online = false } = {}) 
     if (b.settings_pattern) e.push('Backlog の許可ドメイン');
     if (b.sync_script) e.push('Backlog の同期スクリプト');
     if (b.data) e.push('Backlog の同期データ');
-    if (online) e.push('Backlog API（読み取り）');
+    e.push('Backlog API（読み取り）'); // --online なしでも「未確認」として結果に出る（点検が無かったことにしない）
   }
-  if (profile.sonarqube && online) e.push('SonarQube の疎通');
+  if (profile.newrelic) {
+    e.push(`環境変数 ${profile.newrelic.env}`);
+    e.push('New Relic API（NerdGraph）');
+  }
+  if (profile.sonarqube) e.push('SonarQube の疎通');
   if (target) {
     e.push('ツリー', ...Object.keys(profile.sets).map((s) => `セット ${s}`), 'exclude', ...profile.secret_files.map((f) => `秘密ファイル ${f}`));
     if (profile.config_json) e.push(`個人設定 ${profile.config_json.path}`);
@@ -927,14 +1056,28 @@ export async function doctor(profile, { target = null, online = false } = {}) {
   if (extra.length) results.push({ area: 'machine', check: '点検の重複・想定外', status: 'fail', message: `想定より多い点検: ${extra.join(', ')}`, fix: '', evidence: 'expectedChecks' });
   // profile に点検項目が1つも無いと「合計 0」の正常終了になる。点検していないことを成功に見せない
   if (!results.length) results.push({ area: 'machine', check: '点検', status: 'fail', message: '点検の対象が0件', fix: 'profile の env・tools などを確かめる', evidence: 'profile' });
-  const totals = { ok: 0, warn: 0, fail: 0 };
+  const totals = { ok: 0, warn: 0, fail: 0, unknown: 0 };
+  const byPriority = { A: { ...totals }, B: { ...totals }, C: { ...totals } };
   for (const r of results) {
-    if (!(r.status in totals)) { r.message = `不正な判定値 ${r.status}: ${r.message}`; r.status = 'fail'; }
+    if (!Object.hasOwn(totals, r.status)) { r.message = `不正な判定値 ${r.status}: ${r.message}`; r.status = 'fail'; }
+    r.priority = priorityOf(r.check, profile.priorities);
     totals[r.status]++;
+    byPriority[r.priority][r.status]++;
+  }
+  // 完了は「A の点検がすべて ok」。A に warn・fail・unknown が1件でもあれば完了とは言わない（unknown を ok に数えない）
+  const a = byPriority.A;
+  const setupComplete = a.ok > 0 && a.warn + a.fail + a.unknown === 0;
+  // 頼む一覧: 点検が fail・warn のものにひも付いた依頼だけを、頼み先ごとにまとめる。
+  // unknown（確かめていない）では出さない。--online なしの未確認に対して「キーを頼む」と案内すると、持っている人に余計な依頼をさせるため
+  const requests = [];
+  for (const q of profile.requests || []) {
+    const hit = results.filter((r) => q.checks.includes(r.check) && (r.status === 'fail' || r.status === 'warn'));
+    if (hit.length) requests.push({ to: q.to, ask: q.ask, issue: q.issue, place: q.place, checks: hit.map((r) => ({ check: r.check, status: r.status })) });
   }
   // 表示・保存するものはすべてマスクを通す
   for (const r of results) for (const k of ['check', 'message', 'fix', 'evidence']) r[k] = mask(r[k]);
-  return { results, totals, total: results.length };
+  for (const q of requests) { for (const k of ['to', 'ask', 'issue', 'place']) q[k] = mask(q[k]); for (const c of q.checks) c.check = mask(c.check); }
+  return { results, totals, total: results.length, byPriority, setupComplete, requests };
 }
 
 export function fmtDoctor(d) {
@@ -942,10 +1085,104 @@ export function fmtDoctor(d) {
   let area = null;
   for (const r of d.results) {
     if (r.area !== area) { area = r.area; L.push(`== ${{ machine: 'マシン', target: '対象ツリー', delegate: '他のツール' }[area]} ==`); }
-    L.push(`  ${STATUS_MARK[r.status]} ${r.check}: ${r.message}${r.evidence ? `  [${r.evidence}]` : ''}`);
+    L.push(`  ${STATUS_MARK[r.status]} [${r.priority}] ${r.check}: ${r.message}${r.evidence ? `  [${r.evidence}]` : ''}`);
     if (r.fix) L.push(`      → ${r.fix}`);
   }
-  L.push(`合計 ${d.total} = ok ${d.totals.ok} + warn ${d.totals.warn} + fail ${d.totals.fail}`);
+  L.push(`合計 ${d.total} = ok ${d.totals.ok} + warn ${d.totals.warn} + fail ${d.totals.fail} + unknown ${d.totals.unknown}`);
+  for (const p of ['A', 'B', 'C']) {
+    const b = d.byPriority[p];
+    L.push(`優先度 ${p}: ${b.ok + b.warn + b.fail + b.unknown} = ok ${b.ok} + warn ${b.warn} + fail ${b.fail} + unknown ${b.unknown}`);
+  }
+  L.push(d.setupComplete ? 'セットアップ: 完了（優先度 A がすべて ok）'
+    : `セットアップ: 未完了（優先度 A に ok 以外が ${d.byPriority.A.warn + d.byPriority.A.fail + d.byPriority.A.unknown} 件${d.byPriority.A.ok ? '' : '・ok が 0 件'}）`);
+  // 頼む一覧は、そのまま人に送れる形で出す。キーは本人が発行する（頼むのはアカウントと権限まで）
+  if (d.requests && d.requests.length) {
+    L.push('== 頼む一覧（fail・warn の点検に対応する依頼。頼むのはアカウントと権限まで。キーは本人が発行する）==');
+    const byTo = new Map();
+    for (const q of d.requests) byTo.set(q.to, [...(byTo.get(q.to) || []), q]);
+    for (const [to, qs] of byTo) {
+      L.push(`【${to}】 対象の点検: ${[...new Set(qs.flatMap((q) => q.checks.map((c) => `${STATUS_MARK[c.status]} ${c.check}`)))].join('、')}`);
+      for (const q of qs) {
+        L.push(`  依頼文: ${q.ask}`);
+        if (q.issue) L.push(`  受け取った後に自分で発行するもの: ${q.issue}`);
+        if (q.place) L.push(`  入れる場所: ${q.place}`);
+      }
+    }
+  }
+  return mask(L.join('\n'));
+}
+
+// ---------------------------------------------------------------- 前回の doctor との差
+// 直前の doctor の「点検名と状態」だけを残し、次の実行で変わったものを示す。値・メッセージは残さない。
+// 全点検を毎回実行して差だけを示す（前回 fail の項目だけを再確認すると、他の項目の悪化が見えなくなる）。
+// 記録の範囲はマシンだけの実行と、対象ツリーごとに分ける（--target が違えば別の記録）
+
+const STATUSES = ['ok', 'warn', 'fail', 'unknown'];
+function lastFile(target) {
+  const scope = target ? 'tree-' + crypto.createHash('sha256').update(posix(path.resolve(target)).toLowerCase()).digest('hex').slice(0, 10) : 'machine';
+  return path.join(envDir(), `last-doctor-${scope}.json`);
+}
+// 同じ名前の点検が複数あっても、実行順に左右されないよう、名前ごとに状態を並べ替えて 1 つの文字列にする（例: "fail,ok"）
+function statusMap(results) {
+  const by = new Map();
+  for (const r of results) by.set(r.check, [...(by.get(r.check) || []), r.status]);
+  return new Map([...by].map(([k, v]) => [k, v.sort().join(',')]));
+}
+const validStatus = (v) => typeof v === 'string' && v.split(',').every((x) => STATUSES.includes(x));
+// 記録の読み込みで受け付ける上限と形（自分で書いたファイルでも、壊れた・差し替えられた内容で止まらず、出力を偽装されないため）
+const LAST_MAX_BYTES = 256 * 1024;
+const LAST_MAX_CHECKS = 500;
+const LAST_MAX_NAME = 200;
+// 戻り値: { state: 'none' | 'broken' | 'ok', at, online, checks: Map }
+export function loadLastDoctor(target) {
+  const f = lastFile(target);
+  if (!fs.existsSync(f)) return { state: 'none' };
+  try {
+    const st = fs.lstatSync(f);
+    if (!st.isFile() || st.size > LAST_MAX_BYTES) throw new Error('種別・大きさ');
+    const o = JSON.parse(fs.readFileSync(f, 'utf8'));
+    if (!o || typeof o !== 'object' || typeof o.at !== 'string' || !/^\d{4}-\d\d-\d\dT[\d:.]+Z$/.test(o.at) || typeof o.online !== 'boolean') throw new Error('形式');
+    if (!o.checks || typeof o.checks !== 'object' || Array.isArray(o.checks) || Object.keys(o.checks).length > LAST_MAX_CHECKS) throw new Error('形式');
+    const checks = new Map();
+    for (const [k, v] of Object.entries(o.checks)) {
+      if (!validStatus(v) || !k || k.length > LAST_MAX_NAME || /[\u0000-\u001f\u007f]/.test(k)) throw new Error('状態・名前');
+      checks.set(k, v);
+    }
+    return { state: 'ok', at: o.at, online: o.online, checks };
+  } catch { return { state: 'broken' }; }
+}
+export function diffDoctor(d, last, { online = false } = {}) {
+  if (last.state === 'none') return { state: 'none', changes: [] };
+  if (last.state === 'broken') return { state: 'broken', changes: [] };
+  const now = statusMap(d.results);
+  const changes = [];
+  for (const [k, v] of now) {
+    if (!last.checks.has(k)) changes.push({ check: k, from: null, to: v });
+    else if (last.checks.get(k) !== v) changes.push({ check: k, from: last.checks.get(k), to: v });
+  }
+  for (const [k, v] of last.checks) if (!now.has(k)) changes.push({ check: k, from: v, to: null });
+  return { state: 'ok', at: last.at, lastOnline: last.online, online, changes };
+}
+// 保存できなかったときは、黙らずに理由を返す（null なら保存できた）
+export function saveLastDoctor(d, target, { online = false } = {}) {
+  const f = lastFile(target);
+  try {
+    fs.mkdirSync(path.dirname(f), { recursive: true });
+    const checks = {};
+    for (const [k, v] of statusMap(d.results)) checks[mask(k)] = v;
+    const tmp = `${f}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify({ at: new Date().toISOString(), online, checks }, null, 2));
+    renameRetry(tmp, f);
+    return null;
+  } catch (e) { return String(e && e.code || 'error'); }
+}
+export function fmtDiff(df) {
+  if (df.state === 'none') return '前回との差: 前回の記録なし（今回の結果を記録した）';
+  if (df.state === 'broken') return '前回との差: 前回の記録が読めない（今回の結果で作り直した）';
+  const mk = (s) => (s === null ? '(なし)' : s.split(',').map((x) => STATUS_MARK[x]).join(''));
+  const L = [`前回（${df.at}）との差: ${df.changes.length ? `${df.changes.length} 件` : '変化なし'}`];
+  if (df.lastOnline !== df.online) L.push(`  （前回は --online ${df.lastOnline ? 'あり' : 'なし'}・今回は --online ${df.online ? 'あり' : 'なし'}。通信する点検の ? ↔ ✓/✗ は、この違いによる）`);
+  for (const c of df.changes) L.push(`  ${mk(c.from)} → ${mk(c.to)} ${c.check}`);
   return mask(L.join('\n'));
 }
 
@@ -991,9 +1228,17 @@ export async function main(argv) {
     if (o.json) console.error(mask(`profile: ${profilePath()}`));
     else out(`profile: ${profilePath()}`);
     if (cmd === 'doctor') {
-      const d = await doctor(profile, { target: o.target ? path.resolve(o.target) : null, online: !!o.online });
-      if (o.json) console.log(mask(JSON.stringify({ profile: profilePath(), ...d }, null, 2)));
-      else out(fmtDoctor(d));
+      const tgt = o.target ? path.resolve(o.target) : null;
+      const d = await doctor(profile, { target: tgt, online: !!o.online });
+      // 前回との比較は保存より先に行う。保存に失敗しても点検の結果は変えない（失敗は表示して知らせる）
+      const diff = diffDoctor(d, loadLastDoctor(tgt), { online: !!o.online });
+      const saveErr = saveLastDoctor(d, tgt, { online: !!o.online });
+      if (o.json) console.log(mask(JSON.stringify({ profile: profilePath(), ...d, diff, lastSaved: saveErr === null }, null, 2)));
+      else {
+        out(fmtDoctor(d));
+        out(fmtDiff(diff));
+        if (saveErr) out(`（今回の結果を記録できなかった: ${saveErr}。次回の差は出ない）`);
+      }
       return d.totals.fail ? 1 : 0;
     }
     if (!o.target) throw new ConfigError('--target が要る');
@@ -1495,8 +1740,155 @@ process.exit(2);`);
       const d = await doctor(dprof, { target: wt1 });
       delete process.env.UT_ENV_STUB_MODE;
       assert(d.results.some((x) => x.status === 'fail'), 'fail が1件も無く、照合の意味が無い');
-      assert(d.total === d.totals.ok + d.totals.warn + d.totals.fail && d.total === d.results.length, JSON.stringify(d.totals));
-      assert(fmtDoctor(d).includes(`合計 ${d.total} = ok ${d.totals.ok} + warn ${d.totals.warn} + fail ${d.totals.fail}`), '合計行が無い');
+      assert(d.total === d.totals.ok + d.totals.warn + d.totals.fail + d.totals.unknown && d.total === d.results.length, JSON.stringify(d.totals));
+      assert(fmtDoctor(d).includes(`合計 ${d.total} = ok ${d.totals.ok} + warn ${d.totals.warn} + fail ${d.totals.fail} + unknown ${d.totals.unknown}`), '合計行が無い');
+    });
+    await t('doctor: 通信する点検を --online なしで省いたときは unknown（❓）で残し、ok に数えない。終了コードは fail だけが 1', async () => {
+      const p = setProfile({ ...profileObj, env: ['TEST_SECRET_ENV'], backlog: { env: 'TEST_SECRET_ENV', space: 'example.backlog.jp' }, newrelic: { env: 'TEST_SECRET_ENV' }, sonarqube: { url_env: 'TEST_SONAR_URL' } });
+      const off = await doctor(p, { online: false });
+      const names = ['Backlog API（読み取り）', 'New Relic API（NerdGraph）', 'SonarQube の疎通'];
+      for (const n of names) assert(off.results.filter((x) => x.check === n && x.status === 'unknown').length === 1, `${n} が unknown で 1 件ではない`);
+      assert(off.totals.unknown === 3, `unknown ${off.totals.unknown}`);
+      assert(!off.results.some((x) => x.check === '点検漏れ' || x.check === '点検の重複・想定外'), '登録漏れの判定に引っかかった');
+      assert(fmtDoctor(off).includes('? [B] New Relic API（NerdGraph）'), '表示に ? と優先度が無い');
+      // 終了コード: unknown だけなら 0、fail があれば 1（main の返り値で確かめる。totals だけを見ても、返り値の誤りは分からない）
+      const origLog = console.log; console.log = () => {};
+      let c0, c1;
+      try {
+        setProfile({ ...profileObj, env: ['TEST_SECRET_ENV'], tools: { az: true }, newrelic: { env: 'TEST_SECRET_ENV' } });
+        c0 = await main(['doctor']);
+        process.env.UT_ENV_STUB_MODE = 'azfail';
+        try { c1 = await main(['doctor']); } finally { delete process.env.UT_ENV_STUB_MODE; }
+      } finally { console.log = origLog; }
+      assert(c0 === 0 && c1 === 1, `unknown だけのとき ${c0}・fail があるとき ${c1}`);
+    });
+    await t('doctor: 優先度は点検名から決まり、profile の priorities で上書きできる。完了は A がすべて ok のときだけ', async () => {
+      assert(priorityOf('環境変数 X') === 'A' && priorityOf('必須ファイル a') === 'A' && priorityOf('Codex') === 'B' && priorityOf('MCP m') === 'B' && priorityOf('VS Code のデバッグ設定') === 'C' && priorityOf('見知らぬ点検') === 'B', '既定の優先度');
+      assert(priorityOf('Codex', { Codex: 'A' }) === 'A' && priorityOf('Codex', Object.create(null)) === 'B', '上書き');
+      const p = setProfile({ ...profileObj, env: ['TEST_SECRET_ENV'], tools: { az: true } });
+      const base = await doctor(p, { online: false });
+      assert(base.setupComplete === true && fmtDoctor(base).includes('セットアップ: 完了'), `A が ok なのに未完了 ${JSON.stringify(base.byPriority.A)}`);
+      // A に unknown が入る（NR を A に上げた）と、完了とは言わない
+      const q = setProfile({ ...profileObj, env: ['TEST_SECRET_ENV'], newrelic: { env: 'TEST_SECRET_ENV' }, priorities: { 'New Relic API（NerdGraph）': 'A' } });
+      const d = await doctor(q, { online: false });
+      assert(d.byPriority.A.unknown === 1 && d.setupComplete === false && /セットアップ: 未完了/.test(fmtDoctor(d)), `unknown があるのに完了 ${JSON.stringify(d.byPriority.A)}`);
+      // A が 0 件のとき（点検が無い）は完了にしない
+      assert((await doctor(setProfile({ ...profileObj, env: [], tools: { az: true } }), { online: false })).setupComplete === false, 'A が 0 件で完了になった');
+      // 値の検査は、実在する点検名で確かめる（存在しない名前だと名前の検査が先に止め、値の検査の有無が見えない）
+      for (const bad of [{ '環境変数 TEST_SECRET_ENV': 'D' }, { '環境変数 TEST_SECRET_ENV': 1 }, { '環境変数 TEST_SECRET_ENV': 'a' }]) throwsLike(() => setProfile({ ...profileObj, env: ['TEST_SECRET_ENV'], priorities: bad }), /A・B・C/, `不正な値を受け付けた ${JSON.stringify(bad)}`);
+      // 部分一致で A にならない（優先度 A の規則は点検名の全体に当たるものだけ）。__proto__ は黙って捨てずに止める
+      for (const n of ['再点検', '対象ツリーの補助', 'my-exclude-check', 'Claude Code の補助', '点検漏れの確認']) assert(priorityOf(n) === 'B', `${n} が A になった`);
+      throwsLike(() => setProfile({ ...profileObj, priorities: JSON.parse('{"__proto__":"A"}') }), /点検に無い/, '__proto__ を受け付けた');
+      assert(Object.getPrototypeOf(setProfile({ ...profileObj, env: ['TEST_SECRET_ENV'], priorities: { '環境変数 TEST_SECRET_ENV': 'B' } }).priorities) === null, 'priorities が原型を持つ');
+      for (const bad of [{ '': 'A' }, []]) throwsLike(() => setProfile({ ...profileObj, priorities: bad }), /priorities/, `不正な priorities を受け付けた ${JSON.stringify(bad)}`);
+    });
+    await t('doctor: 前回の結果との差を出す（点検名と状態だけを記録し、変わったものだけを示す）。記録が無い・壊れている・保存できないときは黙らない', async () => {
+      const p = setProfile({ ...profileObj, env: ['TEST_SECRET_ENV'], tools: { az: true } });
+      const f = path.join(process.env.UT_ENV_DIR, 'last-doctor-machine.json');
+      fs.rmSync(f, { force: true });
+      const run = async (mode, opts = {}) => {
+        if (mode) process.env.UT_ENV_STUB_MODE = mode; else delete process.env.UT_ENV_STUB_MODE;
+        try {
+          const d = await doctor(p, {});
+          const diff = diffDoctor(d, loadLastDoctor(null), opts);
+          return { d, diff, saveErr: saveLastDoctor(d, null, opts) };
+        } finally { delete process.env.UT_ENV_STUB_MODE; }
+      };
+      const r1 = await run(null);
+      assert(r1.diff.state === 'none' && r1.saveErr === null && /記録なし/.test(fmtDiff(r1.diff)), `初回 ${r1.diff.state}`);
+      const r1b = await run(null);
+      assert(r1b.diff.state === 'ok' && r1b.diff.changes.length === 0 && /変化なし/.test(fmtDiff(r1b.diff)), '変化が無いのに差が出た');
+      const r2 = await run('azfail');
+      assert(r2.diff.changes.length === 1 && r2.diff.changes[0].check === 'Azure CLI のログイン' && r2.diff.changes[0].from === 'ok' && r2.diff.changes[0].to === 'fail', JSON.stringify(r2.diff.changes));
+      assert(/✓ → ✗ Azure CLI のログイン/.test(fmtDiff(r2.diff)), '差の表示');
+      // 記録に残すのは点検名と状態だけ（メッセージ・修正の案内・値は残さない）
+      const raw = fs.readFileSync(f, 'utf8');
+      assert(!/ログイン済み|ログインしていない|az login|現在のプロセスに/.test(raw) && Object.keys(JSON.parse(raw)).sort().join() === 'at,checks,online', '記録に余計な内容が入った');
+      // 点検が増えた・消えた
+      const o = JSON.parse(raw); o.checks['消えた点検'] = 'ok'; delete o.checks['Azure CLI のログイン'];
+      fs.writeFileSync(f, JSON.stringify(o));
+      const r3 = await run(null);
+      assert(r3.diff.changes.some((c) => c.check === '消えた点検' && c.to === null) && r3.diff.changes.some((c) => c.check === 'Azure CLI のログイン' && c.from === null), JSON.stringify(r3.diff.changes));
+      // 壊れた記録・知らない状態値は「読めない」と言って作り直す（差が無いことにしない）
+      for (const bad of ['{', '[]', JSON.stringify({ at: 'x', checks: { a: 'bogus' } }), JSON.stringify({ checks: {} })]) {
+        fs.writeFileSync(f, bad);
+        const r = await run(null);
+        assert(r.diff.state === 'broken' && /読めない/.test(fmtDiff(r.diff)), `壊れた記録 ${bad}`);
+        assert((await run(null)).diff.state === 'ok', '作り直した後も読めない');
+      }
+      // 形の検査（online は真偽値・at は日時・点検名に制御文字なし・件数と大きさの上限・通常のファイルだけ）
+      const good = { at: '2026-11-17T00:00:00.000Z', online: false, checks: { a: 'ok' } };
+      const bigChecks = {}; for (let i = 0; i < 501; i++) bigChecks[`点検${i}`] = 'ok';
+      const cases = [
+        ['online が真偽値でない', { ...good, online: 'yes' }], ['online が無い', { at: good.at, checks: good.checks }],
+        ['at に改行', { ...good, at: '2026-11-17T00:00:00Z\nセットアップ: 完了' }], ['at が日時でない', { ...good, at: '不明' }],
+        ['点検名に改行', { ...good, checks: { '偽の点検\n前回との差: 変化なし': 'fail' } }], ['点検名が長すぎる', { ...good, checks: { ['x'.repeat(201)]: 'ok' } }],
+        ['点検数が多すぎる', { ...good, checks: bigChecks }], ['状態値が不正', { ...good, checks: { a: 'ok,bogus' } }],
+      ];
+      for (const [why, content] of cases) {
+        fs.writeFileSync(f, JSON.stringify(content));
+        assert(loadLastDoctor(null).state === 'broken', `${why}を受け付けた`);
+      }
+      fs.writeFileSync(f, JSON.stringify(good));
+      assert(loadLastDoctor(null).state === 'ok', '正しい記録を読めない（陽性対照）');
+      fs.writeFileSync(f, JSON.stringify({ ...good, pad: 'x'.repeat(300 * 1024) }));
+      assert(loadLastDoctor(null).state === 'broken', '大きすぎる記録を読んだ');
+      fs.rmSync(f); fs.mkdirSync(f);
+      assert(loadLastDoctor(null).state === 'broken', 'ファイルでないものを読んだ');
+      fs.rmSync(f, { recursive: true });
+      // 同名の点検が複数あっても、実行順だけが違うなら差にしない。状態が実際に変わったときだけ差にする
+      const mkd = (...ss) => ({ results: ss.map((s) => ({ check: 'X', status: s })) });
+      fs.writeFileSync(f, JSON.stringify({ ...good, checks: { X: 'fail,ok' } }));
+      const l2 = loadLastDoctor(null);
+      assert(diffDoctor(mkd('fail', 'ok'), l2).changes.length === 0 && diffDoctor(mkd('ok', 'fail'), l2).changes.length === 0, '実行順だけの違いを差にした');
+      assert(diffDoctor(mkd('ok', 'ok'), l2).changes.length === 1, '同名の点検の状態の変化を見逃した');
+      // 対象ツリー同士も別の記録（A を保存しても B には出ず、B を保存しても A は変わらない）
+      const tA = path.join(base, 'ツリーA'), tB = path.join(base, 'ツリーB');
+      assert(saveLastDoctor(r1.d, tA) === null && loadLastDoctor(tA).state === 'ok' && loadLastDoctor(tB).state === 'none', 'ツリー A の記録がツリー B に出た');
+      assert(saveLastDoctor(r2.d, tB) === null && loadLastDoctor(tA).checks.get('Azure CLI のログイン') === 'ok' && loadLastDoctor(tB).checks.get('Azure CLI のログイン') === 'fail', 'ツリー同士の記録が混ざった');
+      // --online の有無が違うときは、その旨を添える
+      const rOn = diffDoctor(r1.d, loadLastDoctor(null), { online: true });
+      assert(/前回は --online なし・今回は --online あり/.test(fmtDiff(rOn)), '--online の違いの注記');
+      // 対象ツリーごとに記録を分ける
+      assert(loadLastDoctor(path.join(process.env.UT_ENV_DIR, 'ツリーA')).state === 'none', 'マシンの記録を別の対象が読んだ');
+      // 保存できないとき（記録の置き場所がファイル）は、エラー名を返す
+      const keep = process.env.UT_ENV_DIR;
+      const blocker = path.join(keep, 'blocker'); fs.writeFileSync(blocker, 'x');
+      process.env.UT_ENV_DIR = blocker;
+      try { assert(typeof saveLastDoctor(r1.d, null) === 'string', '保存できないのに成功と返した'); } finally { process.env.UT_ENV_DIR = keep; }
+    });
+    await t('doctor: 頼む一覧は fail・warn の点検にひも付いた依頼だけを、頼み先ごとに出す。ok・unknown では出さず、定義の誤りは読み込みで止める', async () => {
+      const req = [
+        { to: '頼み先A', checks: ['Azure CLI のログイン'], ask: 'アカウントと権限をください', issue: '個人のアクセストークン', place: 'ユーザー環境変数 TEST_SECRET_ENV' },
+        { to: '頼み先A', checks: ['環境変数 TEST_SECRET_ENV'], ask: '別の依頼文' },
+        { to: '頼み先B', checks: ['New Relic API（NerdGraph）'], ask: '確かめていないだけのときは出さない' },
+      ];
+      const p = setProfile({ ...profileObj, env: ['TEST_SECRET_ENV'], tools: { az: true }, newrelic: { env: 'TEST_SECRET_ENV' }, requests: req });
+      process.env.UT_ENV_STUB_MODE = 'azfail';
+      let bad, good;
+      try { bad = await doctor(p, {}); } finally { delete process.env.UT_ENV_STUB_MODE; }
+      good = await doctor(p, {});
+      assert(bad.requests.length === 1 && bad.requests[0].to === '頼み先A' && bad.requests[0].checks[0].status === 'fail', JSON.stringify(bad.requests));
+      assert(good.requests.length === 0, `ok・unknown なのに依頼が出た ${JSON.stringify(good.requests)}`);
+      const txt = fmtDoctor(bad);
+      assert(/【頼み先A】 対象の点検: ✗ Azure CLI のログイン/.test(txt) && /依頼文: アカウントと権限をください/.test(txt) && /受け取った後に自分で発行するもの: 個人のアクセストークン/.test(txt) && /入れる場所: ユーザー環境変数 TEST_SECRET_ENV/.test(txt), '表示の項目');
+      assert(!txt.includes('頼み先B') && !fmtDoctor(good).includes('頼む一覧'), '出すべきでない依頼が出た');
+      // warn でも出る（陽性対照: 対象ツリーに launch.json が無いと warn になる）
+      const pw = setProfile({ ...profileObj, vscode: true, requests: [{ to: '頼み先W', checks: ['VS Code のデバッグ設定'], ask: 'warn の依頼' }] });
+      const dw = await doctor(pw, { target: wt1 });
+      assert(dw.results.find((x) => x.check === 'VS Code のデバッグ設定')?.status === 'warn', 'warn の前提が成り立たない');
+      assert(dw.requests.length === 1 && dw.requests[0].checks[0].status === 'warn', `warn で依頼が出ない ${JSON.stringify(dw.requests)}`);
+      // 定義の誤りは、黙って効かないままにせず読み込みで止める
+      const mk = (r) => () => setProfile({ ...profileObj, env: ['TEST_SECRET_ENV'], tools: { az: true }, requests: [r] });
+      throwsLike(mk({ to: 'x', checks: ['Azure CLI のログイン（綴り違い）'], ask: 'y' }), /点検に無い/, '存在しない点検名を受け付けた');
+      throwsLike(mk({ to: 'x', checks: [], ask: 'y' }), /1 つ以上/, 'checks が空');
+      throwsLike(mk({ to: '', checks: ['Azure CLI のログイン'], ask: 'y' }), /requests\[0\]\.to/, 'to が空');
+      throwsLike(mk({ to: 'x', checks: ['Azure CLI のログイン'], ask: 'y'.repeat(501) }), /requests\[0\]\.ask/, 'ask が長すぎる');
+      throwsLike(() => setProfile({ ...profileObj, requests: {} }), /requests/, '配列でない requests');
+      for (const [k, v] of [['to', '管理者\nセットアップ: 完了'], ['ask', '権限を\r前回との差: 変化なし'], ['issue', 'a\u0007b'], ['place', 'a\tb']]) {
+        throwsLike(mk({ to: 'x', checks: ['Azure CLI のログイン'], ask: 'y', [k]: v }), /1 行の文字列/, `${k} の制御文字を受け付けた`);
+      }
+      throwsLike(() => setProfile({ ...profileObj, env: ['TEST_SECRET_ENV'], priorities: { '環境変数 TYPO': 'A' } }), /点検に無い/, '存在しない点検名の優先度を受け付けた');
     });
     await t('doctor: 点検の例外が他に波及しない', async () => {
       process.env.UT_ENV_STUB_MODE = 'badjson';
@@ -1718,6 +2110,110 @@ process.exit(2);`);
         } finally { net.run = realRun; if (keep === undefined) delete process.env[name]; else process.env[name] = keep; }
       }
     });
+    await t('newrelic: キーは固定のホストへ POST し、ヘッダー用の値は固定の名前で渡す（陽性対照）。URL・argv・戻り値にキーを出さない', () => {
+      for (const [region, host] of [['us', 'api.newrelic.com'], ['eu', 'api.eu.newrelic.com']]) {
+        const calls = fakeNet({ code: 200, json: true, gqlErrors: false, accounts: 3 });
+        try {
+          const st = nerdgraphStatus(region, 'TEST_SECRET_ENV');
+          assert(st.ok && st.accounts === 3 && calls.length === 1, `${region}: ${JSON.stringify(st)} / 起動 ${calls.length} 回`);
+          const c = calls[0];
+          assert(c.env.UT_ENV_URL === `https://${host}/graphql`, `${region}: 送り先 ${c.env.UT_ENV_URL}`);
+          assert(c.env.UT_ENV_API_KEY === SECRET && !('TEST_SECRET_ENV' in c.env), `${region}: キーを固定の名前で渡していない`);
+          assert(!c.args.join(' ').includes(SECRET) && !c.env.UT_ENV_URL.includes(SECRET), `${region}: キーが argv か URL に入った`);
+          assert(c.args.join(' ').includes("method: 'POST'") && c.args.join(' ').includes("'API-Key'"), `${region}: POST とヘッダーで送っていない`);
+          assert(!JSON.stringify(st).includes(SECRET), `${region}: キーが戻り値に入った`);
+        } finally { net.run = realRun; }
+      }
+    });
+    await t('newrelic: リージョンは us / eu だけ。それ以外は子プロセスを起動しない（profile から送り先の URL を受け取らない）', () => {
+      for (const bad of ['evil', 'US', '', undefined, null, '__proto__', 'constructor', 'toString']) {
+        const calls = fakeNet({ code: 200, json: true, gqlErrors: false, accounts: 1 });
+        try {
+          const st = nerdgraphStatus(bad, 'TEST_SECRET_ENV');
+          assert(st.err === 'destination_refused' && !st.ok && calls.length === 0, `${String(bad)}: 起動 ${calls.length} 回 ${JSON.stringify(st)}`);
+        } finally { net.run = realRun; }
+      }
+      throwsLike(() => setProfile({ ...profileObj, newrelic: { env: 'TEST_SECRET_ENV', region: 'https://evil.example/' } }), /us か eu/, '不正なリージョンを受け付けた');
+      throwsLike(() => setProfile({ ...profileObj, newrelic: { env: 'TEST_SECRET_ENV', region: '__proto__' } }), /us か eu/, '__proto__ を受け付けた');
+      assert(setProfile({ ...profileObj, newrelic: { env: 'TEST_SECRET_ENV' } }).newrelic.region === 'us', '省略時の既定が us ではない');
+    });
+    await t('newrelic: HTTP 200 でも errors があれば、またアカウントが取れなければ失敗にする（成功と偽らない）', () => {
+      const cases = [
+        ['200 で errors', { code: 200, json: true, gqlErrors: true, accounts: null }],
+        ['200 でアカウント 0 件', { code: 200, json: true, gqlErrors: false, accounts: 0 }],
+        ['200 で本文が読めない', { code: 200, json: false, gqlErrors: false, accounts: null }],
+        ['本文が JSON でないのに件数がある（矛盾した出力）', { code: 200, json: false, gqlErrors: false, accounts: 1 }],
+        ['gqlErrors の欄が欠けている', { code: 200, json: true, accounts: 1 }],
+        ['gqlErrors が文字列', { code: 200, json: true, gqlErrors: 'false', accounts: 1 }],
+        ['json の欄が欠けている', { code: 200, gqlErrors: false, accounts: 1 }],
+        ['件数が巨大な数', { code: 200, json: true, gqlErrors: false, accounts: 1e100 }],
+        ['ステータスが範囲外', { code: 99999, json: true, gqlErrors: false, accounts: 1 }],
+        ['errors と件数が両方ある', { code: 200, json: true, gqlErrors: true, accounts: 2 }],
+        ['401', { code: 401, json: true, gqlErrors: false, accounts: null }],
+      ];
+      for (const [name, reply] of cases) {
+        fakeNet(reply);
+        try { assert(nerdgraphStatus('us', 'TEST_SECRET_ENV').ok === false, `${name}: 成功と判定した`); } finally { net.run = realRun; }
+      }
+      fakeNet({ code: 200, json: true, gqlErrors: false, accounts: 1 });
+      try { assert(nerdgraphStatus('us', 'TEST_SECRET_ENV').ok === true, '正常な応答を成功と判定しない（陽性対照）'); } finally { net.run = realRun; }
+    });
+    await t('newrelic: 子の出力はキーや想定外の値を信用しない（件数は非負の整数だけ・err は英字だけ）', () => {
+      fakeNet({ code: 200, json: true, gqlErrors: false, accounts: '3; DROP', err: 'SensitiveValue' });
+      try {
+        const st = nerdgraphStatus('us', 'TEST_SECRET_ENV');
+        assert(st.accounts === null && st.ok === false, `文字列の件数を受け付けた ${JSON.stringify(st)}`);
+        assert(st.err === 'Error' && !JSON.stringify(st).includes('SensitiveValue'), `err をそのまま返した ${JSON.stringify(st)}`);
+      } finally { net.run = realRun; }
+    });
+    await t('newrelic: 応答本文の判定は errors が「ある」だけで失敗にする（配列以外・オブジェクト・文字列も）。空の配列と null だけ無いものとして扱う', () => {
+      const ok = { data: { actor: { accounts: [{ id: 1 }] } } };
+      assert(nerdgraphBody(ok).gqlErrors === false && nerdgraphBody(ok).accounts === 1 && nerdgraphBody(ok).json === true, '正常な本文を誤判定した（陽性対照）');
+      for (const [name, errors] of [['配列', [{ message: 'x' }]], ['オブジェクト', { message: 'x' }], ['文字列', 'denied'], ['数値', 1], ['false', false], ['0', 0]]) {
+        assert(nerdgraphBody({ ...ok, errors }).gqlErrors === true, `errors が${name}でも成功と読んだ`);
+      }
+      assert(nerdgraphBody({ ...ok, errors: [] }).gqlErrors === false && nerdgraphBody({ ...ok, errors: null }).gqlErrors === false, '空の配列・null を errors ありと読んだ');
+      for (const bad of [null, undefined, 'x', 5, [], [ok]]) assert(nerdgraphBody(bad).json === false && nerdgraphBody(bad).accounts === null, `JSON の本文でないもの ${JSON.stringify(bad)} を受け付けた`);
+      assert(nerdgraphBody({ data: { actor: { accounts: 'many' } } }).accounts === null, '配列でない accounts を件数に使った');
+    });
+    await t('newrelic: 同じ環境変数を env・backlog・newrelic が指しても、点検漏れ・重複の判定は正しい（件数で照合する）', async () => {
+      const dup = setProfile({ ...profileObj, env: ['TEST_SECRET_ENV'], backlog: { env: 'TEST_SECRET_ENV', space: 'example.backlog.jp' }, newrelic: { env: 'TEST_SECRET_ENV' } });
+      const calls = fakeNet({ code: 200, json: true, gqlErrors: false, accounts: 1 });
+      try {
+        const d = await doctor(dup, { online: true });
+        const bad = d.results.filter((x) => ['点検漏れ', '点検の重複・想定外'].includes(x.check));
+        assert(bad.length === 0, `重複の判定が誤っている: ${bad.map((x) => x.message).join(' / ')}`);
+        assert(expectedChecks(dup, { online: true }).filter((n) => n === '環境変数 TEST_SECRET_ENV').length === 3, '期待する点検の数が実際と合わない');
+      } finally { net.run = realRun; }
+    });
+    await t('newrelic: profile の newrelic.env に起動に使う変数・内部の変数の名前を使わせない', () => {
+      for (const name of ['PATH', 'SystemRoot', 'UT_ENV_API_KEY', 'ut_env_url']) {
+        throwsLike(() => setProfile({ ...profileObj, newrelic: { env: name } }), /使えない/, `${name} を受け付けた`);
+      }
+    });
+    await t('newrelic: 点検は --online のときだけ通信し、キーを出さず、点検名の登録漏れが無い', async () => {
+      const nprof = setProfile({ ...profileObj, env: ['TEST_SECRET_ENV'], newrelic: { env: 'TEST_SECRET_ENV', region: 'eu' } });
+      const calls = fakeNet({ code: 200, json: true, gqlErrors: false, accounts: 2 });
+      try {
+        const off = await doctor(nprof, { online: false });
+        const offR = off.results.find((x) => x.check === 'New Relic API（NerdGraph）');
+        assert(calls.length === 0, 'online でないのに通信した');
+        // 通信しなかった点検は消さずに「未確認」で残す（ok に数えず、終了コードも変えない）
+        assert(offR && offR.status === 'unknown' && off.totals.unknown === 1 && off.totals.fail === 0, `online なしの判定 ${offR && offR.status}`);
+        const on = await doctor(nprof, { online: true });
+        const r = on.results.find((x) => x.check === 'New Relic API（NerdGraph）');
+        assert(r && r.status === 'ok' && /2 件/.test(r.message), `判定 ${r && r.status} ${r && r.message}`);
+        assert(calls.length === 1 && calls[0].env.UT_ENV_URL === 'https://api.eu.newrelic.com/graphql', `送り先 ${calls[0] && calls[0].env.UT_ENV_URL}`);
+        assert(!(fmtDoctor(on) + JSON.stringify(on)).includes(SECRET), 'キーが出た');
+        assert(expectedChecks(nprof, { online: true }).includes('New Relic API（NerdGraph）'), '期待する点検名に無い');
+      } finally { net.run = realRun; }
+      fakeNet({ code: 200, json: true, gqlErrors: true, accounts: null });
+      try {
+        const bad = await doctor(nprof, { online: true });
+        const r = bad.results.find((x) => x.check === 'New Relic API（NerdGraph）');
+        assert(r && r.status === 'fail' && /errors/.test(r.message), `errors 付きの 200 を失敗にしない ${r && r.status} ${r && r.message}`);
+      } finally { net.run = realRun; }
+    });
     await t('git: 作業フォルダ・相対パスの場所の git を選ばない', () => {
       const exe = process.platform === 'win32' ? 'git.exe' : 'git';
       const cwdDir = path.join(base, 'target-tree-git'); fs.mkdirSync(path.join(cwdDir, 'bin'), { recursive: true });
@@ -1781,7 +2277,7 @@ process.exit(2);`);
       assert(m, '文書に json の例が見つからない');
       const ex = JSON.parse(m[1]);
       const p = setProfile({ ...ex, source: src });
-      assert(p.backlog && p.sonarqube && Object.keys(p.sets).length > 0, '全項目の例の任意の項目が読み込まれない');
+      assert(p.backlog && p.newrelic && p.sonarqube && Object.keys(p.sets).length > 0, '全項目の例の任意の項目が読み込まれない');
     });
     await t('試験用の差し込みは環境変数では効かない（計画に無い書き込み・外部コマンドの差し替えをさせない）', () => {
       const keep = { ...process.env };

@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{TITLE}}</title>
+<style>
+  /* 外部読み込みなし（フォント・画像・スクリプトを読み込まない）。ut-reportdeck.mjs の build がこの器に中身を差し込む */
+  :root {
+    --bg: #ffffff; --surface: #f6f7f9; --ink: #1b1f24; --ink2: #3d444d; --muted: #6a737d;
+    --grid: #e6e8eb; --axis: #9aa1a9; --line: #d5d9de;
+    --s1: #2f6fb3; --s2: #d9822b; --s1w: #e7f0fa; --s2w: #fbefe2;
+    --good: #2e7d4f; --goodt: #e5f3ea; --crit: #b3261e; --critt: #fbe9e7; --warnt: #fff4d6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #16191d; --surface: #1f2328; --ink: #e6e8eb; --ink2: #c3c8ce; --muted: #9aa1a9;
+      --grid: #2c3238; --axis: #6a737d; --line: #353b42;
+      --s1: #6ea8e6; --s2: #f0a35c; --s1w: #1d2a38; --s2w: #3a2c1d;
+      --good: #6cc790; --goodt: #1c2e23; --crit: #f08a82; --critt: #3a1f1d; --warnt: #3a3320;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #16191d; --surface: #1f2328; --ink: #e6e8eb; --ink2: #c3c8ce; --muted: #9aa1a9;
+    --grid: #2c3238; --axis: #6a737d; --line: #353b42;
+    --s1: #6ea8e6; --s2: #f0a35c; --s1w: #1d2a38; --s2w: #3a2c1d;
+    --good: #6cc790; --goodt: #1c2e23; --crit: #f08a82; --critt: #3a1f1d; --warnt: #3a3320;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); line-height: 1.75; overflow-wrap: anywhere;
+    font-family: system-ui, -apple-system, "Segoe UI", "Hiragino Kaku Gothic ProN", "Yu Gothic UI", Meiryo, sans-serif; }
+  main { max-width: 980px; margin: 0 auto; padding: 1.5rem 1rem 3rem; }
+  .cover { padding: 2.5rem 1.5rem; margin-bottom: 1.5rem; background: var(--surface); border-radius: 10px; }
+  .cover .eyebrow { color: var(--muted); font-size: .85rem; margin: 0; }
+  .cover h1 { font-size: 1.8rem; line-height: 1.35; margin: .4rem 0 .8rem; }
+  .cover .lead { font-size: 1.05rem; color: var(--ink2); margin: 0 0 1rem; }
+  .cover .howto { font-size: .9rem; color: var(--ink2); border-left: 4px solid var(--s1); padding: .3rem .8rem; margin: 1rem 0; }
+  .cover .doctype { font-size: .9rem; color: var(--ink2); margin: .6rem 0; }
+  .cover .byline, .sensitivity { font-size: .82rem; color: var(--muted); margin: .3rem 0; }
+  .sensitivity { display: inline-block; padding: .15rem .6rem; border-radius: 4px; background: var(--warnt); }
+  .slide { padding: 1.6rem 1.2rem; margin: 0 0 1.4rem; border: 1px solid var(--line); border-radius: 10px; background: var(--bg); }
+  .slide.limits { border-color: var(--crit); }
+  .kick { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; color: var(--muted); font-size: .85rem; }
+  .kick .no { font-weight: 700; color: var(--s1); font-variant-numeric: tabular-nums; }
+  .slide h2 { font-size: 1.35rem; line-height: 1.45; margin: .5rem 0 1rem; }
+  .chip { display: inline-block; font-size: .75rem; padding: .05rem .5rem; border-radius: 999px; border: 1px solid var(--line); color: var(--ink2); }
+  .chip.fact { background: var(--s1w); border-color: var(--s1); }
+  .chip.view { background: var(--s2w); border-color: var(--s2); }
+  .chip.hyp { background: var(--warnt); border-style: dashed; }
+  .chip.prop { background: var(--goodt); border-color: var(--good); }
+  .chip.ai { background: var(--surface); border-style: dotted; }
+  .slide p { margin: .6rem 0; }
+  .note { font-size: .88rem; color: var(--ink2); border-left: 3px solid var(--axis); padding: .2rem .7rem; margin: .8rem 0; }
+  .src { font-size: .78rem; color: var(--muted); margin-top: 1rem; }
+  .fig { margin: .6rem 0 1rem; }
+  .fig .q { font-size: .82rem; color: var(--muted); margin: 0 0 .3rem; }
+  .chart { width: 100%; height: auto; display: block; }
+  .chart text { fill: var(--ink2); font-size: 12px; }
+  .chart .grid { stroke: var(--grid); }
+  .chart .axis { stroke: var(--axis); }
+  .chart .unit { fill: var(--muted); font-size: 11px; }
+  .chart .s1 { fill: var(--s1); } .chart .s2 { fill: var(--s2); }
+  .chart .ls1 { stroke: var(--s1); fill: none; stroke-width: 2.5; } .chart .ls2 { stroke: var(--s2); fill: none; stroke-width: 2.5; }
+  .chart .partial { opacity: .45; }
+  .chart .plan { stroke-dasharray: 6 5; }
+  .chart .avg { stroke: var(--ink2); stroke-dasharray: 5 4; stroke-width: 1.5; }
+  .chart .avgl { paint-order: stroke; stroke: var(--bg); stroke-width: 4px; font-size: 11px; }
+  .chart .brk { stroke: var(--muted); fill: none; }
+  .chart .hit { fill: transparent; }
+  .chart .node { fill: var(--surface); stroke: var(--ink2); }
+  .chart .node.ok { stroke-width: 2.5; }
+  .chart .node.ind { stroke-dasharray: 6 4; stroke-width: 1.6; }
+  .chart .node.no { stroke-dasharray: 2 4; stroke-width: 1.6; }
+  .chart .edge { stroke: var(--ink2); stroke-width: 1.5; fill: none; }
+  .chart .edge.ok { stroke-width: 2.2; }
+  .chart .edge.ind { stroke-dasharray: 6 4; }
+  .chart .edge.no { stroke-dasharray: 2 4; }
+  .chart.tl { max-width: 560px; margin: 0 auto; }
+  .chart.tl text { font-size: 15px; }
+  .chart.tl .evdate { font-size: 13px; }
+  .chart.tl .tag { font-size: 11px; }
+  .chart .ev { fill: var(--surface); stroke: var(--ink2); }
+  .chart .ev.done { stroke-width: 2.5; }
+  .chart .ev.plan { stroke-dasharray: 6 4; stroke-width: 1.6; }
+  .chart .evdate { font-weight: 600; }
+  .chart .tag { fill: var(--muted); font-size: 10px; }
+  .chart .arrow { fill: var(--ink2); }
+  .legend { display: flex; flex-wrap: wrap; gap: .4rem 1rem; font-size: .8rem; color: var(--ink2); margin: .3rem 0; }
+  .legend .sw { display: inline-block; width: 1.4rem; height: .7rem; vertical-align: middle; margin-right: .3rem; border-radius: 2px; }
+  .legend .sw.s1 { background: var(--s1); } .legend .sw.s2 { background: var(--s2); }
+  .legend .sw.line { height: 0; border-top: 2px solid var(--ink2); border-radius: 0; }
+  .legend .sw.dash { height: 0; border-top: 2px dashed var(--ink2); border-radius: 0; }
+  .legend .sw.dot { height: 0; border-top: 2px dotted var(--ink2); border-radius: 0; }
+  .legend .sw.pt { opacity: .45; background: var(--s1); }
+  .wide { overflow-x: auto; }
+  .wide .chart { min-width: 720px; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: .8rem; margin: .8rem 0; }
+  .tile { background: var(--surface); border-radius: 8px; padding: .8rem 1rem; }
+  .tile .v { font-size: 1.6rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .tile .l { font-size: .82rem; color: var(--muted); }
+  .cards { display: grid; grid-template-columns: repeat(2, 1fr); gap: .8rem; margin: .8rem 0; }
+  .cards.n3 { grid-template-columns: repeat(3, 1fr); }
+  .card { border: 1px solid var(--line); border-radius: 8px; padding: .7rem .9rem; }
+  .card h3 { font-size: .95rem; margin: 0 0 .3rem; }
+  .card .mark { font-weight: 700; margin-right: .3rem; }
+  .card.good { border-color: var(--good); background: var(--goodt); }
+  .card.bad { border-color: var(--crit); background: var(--critt); }
+  .card.open { border-style: dashed; }
+  .slide.conclusion { border-width: 2px; border-color: var(--s1); }
+  .goal { background: var(--s1w); border-left: 4px solid var(--s1); border-radius: 4px; padding: .5rem .9rem; margin: .6rem 0 1rem; }
+  .goal .gt, .checks .gt { font-size: .82rem; font-weight: 700; color: var(--ink2); margin: 0 0 .2rem; }
+  .goal ul.items { margin: .2rem 0; }
+  .checks { margin: 1.2rem 0 .6rem; padding-top: .6rem; border-top: 1px dashed var(--line); }
+  .checks details { font-size: .92rem; }
+  .checks details summary { color: var(--ink); }
+  .checks details p { margin: .3rem 0 .6rem 1rem; color: var(--ink2); }
+  details { margin: .6rem 0; font-size: .88rem; }
+  details summary { cursor: pointer; color: var(--muted); }
+  .tw { overflow-x: auto; }
+  table { border-collapse: collapse; margin: .5rem 0; font-size: .85rem; }
+  th, td { border: 1px solid var(--line); padding: .3rem .6rem; text-align: right; white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  table.terms th, table.terms td { text-align: left; white-space: normal; vertical-align: top; }
+  th { background: var(--surface); }
+  ul.items { margin: .5rem 0; padding-left: 1.3rem; }
+  footer { margin-top: 2rem; padding-top: 1rem; border-top: 1px solid var(--line); color: var(--muted); font-size: .78rem; }
+  @media (max-width: 720px) {
+    .cover h1 { font-size: 1.45rem; }
+    .slide { padding: 1.2rem .9rem; }
+    .slide h2 { font-size: 1.15rem; }
+    .cards, .cards.n3 { grid-template-columns: 1fr; }
+  }
+  @media print {
+    .slide { break-inside: avoid; }
+    details { display: block; }
+    details > :not(summary) { display: block; }
+  }
+</style>
+</head>
+<body>
+<main>
+{{COVER}}
+{{SLIDES}}
+<footer>生成: {{GENERATED_AT}} ／ {{SENSITIVITY}} ／ 数字は正本から転記して作り、正本との照合は第三者の検証で行います（結果は作成時の報告を見てください）。共有する前に、機微情報の伏せ方を人が確かめてください。</footer>
+</main>
+</body>
+</html>

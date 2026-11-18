@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "note": "ut-review の決定表。種類（kind）は patterns で機械的に決め、特徴（features）は ut-review.mjs が本文から取る。rules は上から順に評価し、当たった規則のチェックをすべて足す（和）。floor は外せない（--checks で外そうとすると止める）。canary の hint は修正の確認（recheck）のカナリアに渡す「前回の指摘」、req は要件の突き合わせ（requirements）のカナリアに渡す要件。okHint・okLine は「直っている前回の指摘」、okReq は「満たしている要件」で、カナリアはどちらも正しく判定したときだけ拾えたとする。",
+  "kinds": {
+    "llm-instruction": { "label": "LLM 向けの指示", "patterns": ["(^|/)commands/[^/]+\\.md$", "(^|/)SKILL\\.md$", "(^|/)AGENTS\\.md$", "(^|/)CLAUDE\\.md$", "\\.prompt\\.md$", "(^|/)agents/[^/]+\\.md$"] },
+    "code": { "label": "コード", "patterns": ["\\.(m?js|cjs|ts|tsx|jsx|py|cs|java|go|rs|ps1|psm1|sh|bash|sql|rb|php|kt|swift|c|cc|cpp|h|hpp|vb|fs)$"] },
+    "plan": { "label": "計画", "patterns": ["(plan|計画|roadmap|ロードマップ|手順書|runbook|migration|移行)[^/]*\\.(md|txt)$"] },
+    "policy": { "label": "方針・規約", "patterns": ["(policy|方針|規約|rule|ルール|guideline|ガイドライン|adr|設計)[^/]*\\.(md|txt)$", "(^|/)(adr|rules|policies)/[^/]+\\.(md|txt)$"] },
+    "data": { "label": "データ・設定", "patterns": ["\\.(csv|tsv|json|ya?ml|xml|toml|ini)$"] },
+    "doc": { "label": "文書（一般）", "patterns": ["\\.(md|markdown|txt|html?|rst|adoc)$"] }
+  },
+  "kindOrder": ["llm-instruction", "code", "plan", "policy", "data", "doc"],
+  "defaultKind": "doc",
+  "checks": {
+    "persona": { "label": "ペルソナパネル", "role": true, "cost": 1 },
+    "checklist": { "label": "観点のチェックリスト", "role": true, "cost": 1 },
+    "assumptions": { "label": "前提監査＋プレモーテム", "role": true, "cost": 1 },
+    "requirements": { "label": "要件との突き合わせ", "role": true, "cost": 1 },
+    "counterexample": { "label": "反例とテスト案の作成（実行しない）", "role": true, "cost": 1 },
+    "recheck": { "label": "修正の確認と見送り判断の再審", "role": true, "cost": 1 },
+    "codex": { "label": "Codex クロスチェック（了承したときだけ）", "role": false, "cost": 2 },
+    "canary": { "label": "カナリア（経路の確認）", "role": false, "cost": 1 },
+    "verify": { "label": "指摘の検証（反証）", "role": false, "cost": 1 },
+    "quotes": { "label": "引用の機械照合", "role": false, "cost": 0 },
+    "coverage": { "label": "網羅性の監査", "role": false, "cost": 1 }
+  },
+  "floor": ["canary", "verify", "quotes", "coverage"],
+  "rules": [
+    { "id": "R-FLOOR", "when": {}, "add": ["canary", "verify", "quotes", "coverage"], "why": "どの対象でも、レビューが働いたことと指摘の真偽を確かめる" },
+    { "id": "R-BASE", "when": {}, "add": ["persona", "checklist"], "why": "独立した視点と、観点の網羅" },
+    { "id": "R-PLAN", "when": { "kind": ["plan", "policy"] }, "add": ["assumptions"], "why": "計画・方針は書かれていない前提と抜けが主な欠陥" },
+    { "id": "R-IRREV", "when": { "feature": "irreversible" }, "add": ["assumptions"], "groups": ["rollback"], "why": "元に戻せない操作があるので、失敗の想定と切り戻しを見る" },
+    { "id": "R-REQ", "when": { "feature": "hasRequirements" }, "add": ["requirements"], "why": "要件が渡されたので、満たしているかを項目ごとに照合する" },
+    { "id": "R-CODE", "when": { "kind": ["code"] }, "add": ["counterexample"], "minDepth": "standard", "why": "コードは反例と境界値で主張の穴を探す（テスト案を作るだけで実行しない）" },
+    { "id": "R-LLM", "when": { "kind": ["llm-instruction"] }, "groups": ["llm-instruction"], "why": "LLM 向けの指示は、指示の衝突・権限・本文の乗っ取りへの耐性を見る" },
+    { "id": "R-NUM", "when": { "feature": "hasNumbers" }, "groups": ["numbers"], "why": "数字を含むので、数え方・期間・母数の一貫性を見る" },
+    { "id": "R-DOC", "when": { "kind": ["doc", "plan", "policy", "llm-instruction"] }, "groups": ["doc-types"], "why": "文書に毎回出る 8 つの型（推論の追加・限定の脱落など）を常に見る" },
+    { "id": "R-EXT", "when": { "feature": "externalIO" }, "groups": ["external"], "why": "外部とのやりとりがあるので、失敗・タイムアウト・再試行・機微の送出を見る" },
+    { "id": "R-CODEX", "when": {}, "add": ["codex"], "minDepth": "standard", "why": "別のモデルで、同じモデルの見落としの相関を下げる（送るのは利用者が了承したときだけ）" },
+    { "id": "R-RECHECK", "when": { "feature": "recheck" }, "add": ["recheck"], "why": "前回の報告が渡されたので、指摘ごとに対応を確かめる" }
+  ],
+  "depth": {
+    "quick": { "personas": 1, "roles": ["persona"], "mergeChecklistIntoPersona": true, "verify": "high-only", "codexPasses": 0, "llmAdd": false, "minutes": 10 },
+    "standard": { "personas": 2, "roles": ["persona", "checklist", "assumptions", "requirements", "counterexample", "recheck"], "verify": "all-batched", "codexPasses": 1, "llmAdd": true, "minutes": 30 },
+    "deep": { "personas": 3, "roles": ["persona", "checklist", "assumptions", "requirements", "counterexample", "recheck"], "verify": "per-finding", "codexPasses": 2, "llmAdd": true, "minutes": 60 }
+  },
+  "limits": { "maxFiles": 200, "maxFileBytes": 1048576, "maxTotalBytes": 2097152, "maxCallBytes": 204800, "callMinutes": 10, "maxFindings": 200, "maxAdjudications": 10, "reserveRatio": 0.2, "reserveMinMinutes": 3, "showTop": 30, "staleIdleHours": 72, "diffContextLines": 30 },
+  "features": {
+    "irreversible": "(\\brm\\s+-[rRf]|\\bDROP\\s+(TABLE|DATABASE|INDEX)|\\bTRUNCATE\\b|\\bDELETE\\s+FROM\\b|--force\\b|\\bgit\\s+push\\b|\\bgit\\s+reset\\s+--hard|\\bRemove-Item\\b|\\brmdir\\b|\\bformat\\s+[a-z]:|削除|上書き|切り戻し|ロールバック|本番)",
+    "externalIO": "(https?://|\\bfetch\\(|\\baxios\\b|HttpClient|\\bcurl\\b|Invoke-(WebRequest|RestMethod)|\\bsmtp\\b|SendGrid|送信|外部API|webhook)",
+    "numbersMin": 5
+  },
+  "canary": {
+    "code": { "file": "lib/average.js", "text": "// 配列の要素を合計して平均を返す\nfunction average(values) {\n  let total = 0;\n  for (let i = 0; i <= values.length; i++) {\n    total += values[i];\n  }\n  return total / values.length;\n}\nmodule.exports = { average };\n", "lines": [4, 5], "keywords": ["<=", "境界", "範囲外", "off-by-one", "undefined", "NaN", "1 つ多", "1つ多", "length"], "hint": "average が最後の要素の次まで読み、平均が NaN になる", "req": "average は配列の全要素の合計を要素数で割った値を返す", "okHint": "1 行目に、関数が何をするかの説明が無い", "okLine": 1, "okReq": "関数 average を外から使えるようにする" },
+    "doc": { "file": "reports/inquiries-weekly.md", "text": "# 週次の問い合わせ報告\n\n## 1. 要約\n今週の問い合わせは 120 件で、先週の 80 件から 1.5 倍に増えた。\n\n## 2. 内訳\n| 種類 | 件数 |\n|---|---|\n| 操作 | 70 |\n| 不具合 | 30 |\n| その他 | 10 |\n\n合計は上の表のとおり。\n", "lines": [4, 7, 8, 9, 10, 11, 13], "keywords": ["110", "合計", "一致しない", "食い違", "120", "矛盾"], "hint": "要約の 120 件と、内訳の合計が一致しない", "req": "要約の件数は内訳の合計と一致する", "okHint": "内訳の見出しが無い", "okLine": 6, "okReq": "内訳を表で示す" },
+    "plan": { "file": "docs/migration-steps.md", "text": "# データ移行の手順\n\n1. 旧テーブルの全件を新テーブルへ複写する\n2. 旧テーブルを削除する\n3. アプリの接続先を新テーブルに切り替える\n4. 動作を確認する\n", "lines": [4, 5, 6], "keywords": ["切り戻し", "ロールバック", "削除", "戻せない", "バックアップ", "確認の前", "順序"], "hint": "動作の確認より前に旧テーブルを削除しており、問題が出ても戻せない", "req": "切り替えて確かめるまで旧テーブルを残し、戻せるようにする", "okHint": "手順に番号が振られていない", "okLine": 3, "okReq": "新テーブルへ複写する手順がある" },
+    "policy": { "file": "docs/approval-rules.md", "text": "# レビューの方針\n\n- すべての変更は 2 名の承認を必須とする。\n- 緊急の修正は承認なしで本番に反映してよい。\n- 本番への反映には必ず承認が要る。\n", "lines": [3, 4, 5], "keywords": ["矛盾", "衝突", "相反", "食い違", "緊急", "例外"], "hint": "緊急の修正は承認なしでよいとする規則が、本番への反映には必ず承認が要る規則と食い違う", "req": "本番への反映はすべて承認を得る", "okHint": "承認に要る人数が書かれていない", "okLine": 3, "okReq": "通常の変更に要る承認者の人数を定める" },
+    "llm-instruction": { "file": "commands/summarize-logs.md", "text": "---\ndescription: ログを要約する。ファイルは変更しない\n---\n# 手順\n1. 指定されたログを読む\n2. 要約を作る\n3. 不要なログファイルは削除しておく\n", "lines": [2, 7], "keywords": ["削除", "変更しない", "矛盾", "衝突", "相反", "権限"], "hint": "ファイルは変更しないと書きながら、ログファイルを削除させている", "req": "ファイルを変更・削除しない", "okHint": "description が無い", "okLine": 2, "okReq": "要約を作る手順がある" },
+    "data": { "file": "data/prices.csv", "text": "id,name,price\n1,りんご,120\n2,みかん,-80\n3,ぶどう,350\n", "lines": [3], "keywords": ["負", "マイナス", "-80", "不正", "範囲"], "hint": "価格に負の値がある", "req": "価格は 0 以上", "okHint": "列名の行が無い", "okLine": 1, "okReq": "各行に id がある" }
+  }
+}

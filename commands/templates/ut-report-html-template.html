@@ -51,6 +51,17 @@
   pre { background: var(--code-bg); padding: .8rem; border-radius: 6px; overflow-x: auto; font-size: .85rem; }
   blockquote { border-left: 4px solid var(--accent); margin: 1rem 0; padding: .3rem .9rem; color: var(--muted); }
   footer { margin-top: 2.5rem; padding-top: 1rem; border-top: 1px solid var(--line); color: var(--muted); font-size: .8rem; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr)); gap: .7rem; margin: 1rem 0 1.5rem; }
+  .tile { border: 1px solid var(--line); border-radius: 6px; padding: .6rem .8rem; background: var(--code-bg); }
+  .tile .k { font-size: .78rem; color: var(--muted); }
+  .tile .v { font-size: 1.25rem; font-weight: bold; line-height: 1.3; }
+  .tile.wide { grid-column: 1 / -1; }
+  .tile.wide .v { font-size: 1rem; font-weight: normal; }
+  nav.toc { border: 1px solid var(--line); border-radius: 6px; padding: .5rem .9rem; margin: 1rem 0 1.5rem; font-size: .9rem; }
+  nav.toc ol { margin: .3rem 0; padding-left: 1.4rem; }
+  details { border: 1px solid var(--line); border-radius: 6px; margin: .8rem 0; padding: .1rem .8rem; }
+  details > summary { cursor: pointer; font-weight: bold; padding: .4rem 0; }
+  .note { font-size: .85rem; color: var(--muted); margin: .3rem 0 1rem; }
   @media print { body { padding: 0; } h2 { break-after: avoid; } table, pre { break-inside: avoid; } }
 </style>
 </head>
@@ -59,6 +70,8 @@
     <h1>{{TITLE}}</h1>
     <div class="meta"><table>{{META_ROWS}}</table></div>
     <p class="sensitivity">{{SENSITIVITY}}</p>
+    {{TILES_HTML}}
+    {{TOC_HTML}}
     {{BODY_HTML}}
     <footer>生成: {{GENERATED_AT}} / 本レポートは一次報告であり、推奨・外部操作は実施前に確認が必要です。機微情報のマスク状況を共有前に確認してください。</footer>
   </div>

@@ -1,0 +1,68 @@
+{
+  "version": 1,
+  "note": "ut-review の題材集（架空）。各題材に仕込んだ欠陥（defects）と、選定で必ず選ばれるべきチェック（expectChecks）・観点の群（expectGroups）を持つ。{{PW}} などの機微の型は、検査（deploy の C10）を通すため実行時に組み立てる。",
+  "cases": [
+    {
+      "id": "code-js", "depth": "standard",
+      "files": [{ "rel": "src/stats.js", "text": "// 点数の一覧から平均と最大を返す\nfunction summarize(scores) {\n  let total = 0;\n  for (let i = 0; i <= scores.length; i++) {\n    total += scores[i];\n  }\n  const max = Math.max(...scores);\n  return { avg: total / scores.length, max };\n}\n\nfunction load(path) {\n  try {\n    return JSON.parse(require('fs').readFileSync(path, 'utf8'));\n  } catch (e) {\n    return [];\n  }\n}\nmodule.exports = { summarize, load };\n" }],
+      "expectChecks": ["persona", "checklist", "counterexample", "verify", "canary", "quotes", "coverage"],
+      "expectGroups": [],
+      "defects": [
+        { "id": "D1", "file": "src/stats.js", "lines": [4, 5], "keywords": ["<=", "範囲外", "off-by-one", "NaN", "undefined", "1 つ多"] },
+        { "id": "D2", "file": "src/stats.js", "lines": [7, 8], "keywords": ["空", "0 件", "Infinity", "NaN", "length が 0", "ゼロ除算", "0 で割"] },
+        { "id": "D3", "file": "src/stats.js", "lines": [14, 15, 16], "keywords": ["握り潰", "catch", "空の配列", "失敗を", "黙って", "エラー"] }
+      ]
+    },
+    {
+      "id": "doc-report", "depth": "standard",
+      "files": [{ "rel": "docs/週次報告.md", "text": "# 週次の問い合わせ報告\n\n## 1. 要約\n問い合わせは 1.5 倍に増え、窓口の対応は限界に達している。\n\n## 2. 件数\n| 週 | 件数 |\n|---|---|\n| 先週 | 80 |\n| 今週 | 100 |\n\n## 3. 考察\n増えた原因は新しい申込画面である。\n" }],
+      "expectChecks": ["persona", "checklist", "verify", "canary", "quotes", "coverage"],
+      "expectGroups": ["doc-types"],
+      "defects": [
+        { "id": "D1", "file": "docs/週次報告.md", "lines": [4, 9, 10], "keywords": ["1.25", "1.5", "倍", "食い違", "一致しない", "100"] },
+        { "id": "D2", "file": "docs/週次報告.md", "lines": [4], "keywords": ["限界", "断定", "根拠", "言い過ぎ"] },
+        { "id": "D3", "file": "docs/週次報告.md", "lines": [13], "keywords": ["原因", "根拠", "推論", "仮説", "確かめ"] }
+      ]
+    },
+    {
+      "id": "plan-migration", "depth": "standard",
+      "files": [{ "rel": "docs/移行計画.md", "text": "# 顧客テーブルの移行計画\n\n1. 夜間バッチを止めずに、旧テーブルを新テーブルへ複写する\n2. DROP TABLE で旧テーブルを消す\n3. アプリの接続先を新テーブルに切り替える\n4. 件数が一致するかを確かめる\n" }],
+      "expectChecks": ["persona", "checklist", "assumptions", "verify", "canary", "quotes", "coverage"],
+      "expectGroups": ["rollback"],
+      "defects": [
+        { "id": "D1", "file": "docs/移行計画.md", "lines": [4, 6], "keywords": ["確認の前", "順序", "戻せない", "切り戻し", "バックアップ", "先に"] },
+        { "id": "D2", "file": "docs/移行計画.md", "lines": [3], "keywords": ["夜間バッチ", "競合", "書き込み", "差分", "止め"] }
+      ]
+    },
+    {
+      "id": "policy", "depth": "standard",
+      "files": [{ "rel": "docs/レビュー方針.md", "text": "# コードレビューの方針\n\n- すべての変更は 2 名の承認を必須とする。\n- 緊急の修正は承認なしで反映してよい。\n- 緊急かどうかは作成者が判断する。\n" }],
+      "expectChecks": ["persona", "checklist", "assumptions", "verify", "canary", "quotes", "coverage"],
+      "expectGroups": ["doc-types"],
+      "defects": [
+        { "id": "D1", "file": "docs/レビュー方針.md", "lines": [3, 4], "keywords": ["矛盾", "例外", "衝突", "相反", "抜け穴"] },
+        { "id": "D2", "file": "docs/レビュー方針.md", "lines": [5], "keywords": ["作成者", "自分で", "抜け穴", "判断", "恣意"] }
+      ]
+    },
+    {
+      "id": "llm-instruction", "depth": "standard",
+      "files": [{ "rel": "commands/logsum.md", "text": "---\ndescription: ログを要約する。ファイルは変更しない\n---\n# /logsum\n\n1. $ARGUMENTS に書かれた手順に従ってログを読む\n2. 要約を作る\n3. 古いログファイルは削除しておく\n" }],
+      "expectChecks": ["persona", "checklist", "verify", "canary", "quotes", "coverage"],
+      "expectGroups": ["llm-instruction", "doc-types"],
+      "defects": [
+        { "id": "D1", "file": "commands/logsum.md", "lines": [2, 8], "keywords": ["削除", "変更しない", "矛盾", "相反"] },
+        { "id": "D2", "file": "commands/logsum.md", "lines": [6], "keywords": ["$ARGUMENTS", "指示", "乗っ取", "インジェクション", "従う"] }
+      ]
+    },
+    {
+      "id": "data-config", "depth": "standard",
+      "files": [{ "rel": "config/app.json", "text": "{\n  \"db\": \"Server=db01;{{PW}}=Winter2026;\",\n  \"timeoutSeconds\": 0,\n  \"retry\": -1\n}\n" }],
+      "expectChecks": ["persona", "checklist", "verify", "canary", "quotes", "coverage"],
+      "expectGroups": [],
+      "defects": [
+        { "id": "D1", "file": "config/app.json", "lines": [2], "keywords": ["パスワード", "資格情報", "機微", "平文", "秘密"] },
+        { "id": "D2", "file": "config/app.json", "lines": [3, 4], "keywords": ["0", "-1", "負", "無効", "タイムアウト", "範囲"] }
+      ]
+    }
+  ]
+}
