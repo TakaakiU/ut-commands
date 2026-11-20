@@ -19,7 +19,7 @@ Claude Code の個人用スラッシュコマンド集です。作者が自分�
 | `/ut-docrewrite` | 既存ドキュメントを、経緯を知らない読者向けに全面再構成する。文書構成規約があれば検出して従う |
 | `/ut-sqlpatch` | 調査・復旧用SQLを人がレビューしやすい形で生成する。SELECT単独も対象とし、1クエリ1目的で単純化する。更新時は確認 / 適用 / ロールバックへ分ける（DBへは接続しない） |
 | `/ut-diskreport` | ディスク容量の入口。**対象データは変更しない**（目安のレポートだけ保存）。削除・圧縮・OneDrive の解放のどれが効くかを、次に打つコマンドつきで示す |
-| `/ut-diskclean` | 再生成できるもの（キャッシュ・ビルド成果物・一時ファイル）だけを、承認記録に載せたうえで削除する。`--apply`・確認への応答・承認記録の保存の**3条件が欠けたら何も削除しない** |
+| `/ut-diskclean` | 再生成できるもの（キャッシュ・ビルド成果物・一時ファイル）だけを、承認記録に載せたうえで削除する。`--apply`・確認への応答・承認記録の保存の**3条件が欠けたら何も削除しない**。削除の判定と実行は `tools/ut-clean.mjs` が行い、承認した計画に載ったものだけを、削除の直前に測り直してから消す（リンクやハードリンクを含むもの・測れないものは一括削除の対象にしない） |
 | `/ut-diskarchive` | 過去データを、**元を残したまま** 1 ファイルずつ 7z にする。元は移動・削除しない（元を消すのは利用者）。元を消してよいかを確かめる検査も持つ |
 | `/ut-copyblock` | 別媒体へ移す SQL・コード・文面などを、1単位＝1コードブロックで出力する応答モード |
 | `/ut-commentrewrite` | 作業ブランチの差分で追加・変更されたソースコメントを、経緯を知らない読者に意味が通る形へ書き直す。**コメントを除いたソースがバイト一致すること**を機械照合してからでないと適用しない |
@@ -44,11 +44,12 @@ Claude Code の個人用スラッシュコマンド集です。作者が自分�
 | --- | --- |
 | Node.js 20.11 以上と、`commands/templates/` の部品 4 本（`deploy.mjs` で配置される）。差分を対象にするときは git | 止まる（記憶で代わりをしない。git の外は `--files` で指定） |
 | 読み取りだけのサブエージェント | 「未実施（サブエージェントが使えない）」と報告して止まる |
+| サブエージェント定義 `ut-review-reader`（`--target claude-agents` で `~/.claude/agents/` へ配置。道具は `Read`・`Grep`・`Glob` だけ。任意） | 汎用のサブエージェントに「読み取りだけ」を指示文で伝えて続ける。この場合の読み取り専用は指示文の約束で、仕組みでは止まらない |
 | Codex CLI とログイン（任意） | 「Codex: 未実施（理由）」として Claude だけで続ける |
 
 用語: **正本**＝数字と主張の出どころになる検証済みの本編。**根拠の強さ**＝各ページの主張が事実・認識・仮説・提案・AI のたたき台のどれかを示すラベル。**陽性対照**＝「0 件」と言う前に、わざと問題を入れた見本で検査が拾うことを確かめる手順。
 
-⚠️ `/ut-diskarchive` と、`/ut-diskreport` の圧縮の見込みは `tools/ut-archive.mjs` を使います。`deploy.mjs` は `tools/` を配置しないため、環境変数 `UT_COMMANDS_ROOT` にこのリポジトリの場所を設定するか、リポジトリの直下で打ってください（見つからなければ止まります）。圧縮には 7-Zip（`7z.exe`）が要ります。圧縮しても、**元を消すまで空き容量は増えません**（OneDrive の下では、`--release-local` を明示したときだけこの PC の空きが増えます）。
+⚠️ `/ut-diskclean` は `tools/ut-clean.mjs` を、`/ut-diskarchive` と、`/ut-diskreport` の圧縮の見込みは `tools/ut-archive.mjs` を使います。`deploy.mjs` は `tools/` を配置しないため、環境変数 `UT_COMMANDS_ROOT` にこのリポジトリの場所を設定するか、リポジトリの直下で打ってください（見つからなければ止まります）。圧縮には 7-Zip（`7z.exe`）が要ります。圧縮しても、**元を消すまで空き容量は増えません**（OneDrive の下では、`--release-local` を明示したときだけこの PC の空きが増えます）。
 
 ## 中身
 
@@ -73,6 +74,7 @@ Claude Code の個人用スラッシュコマンド集です。作者が自分�
 | `commands/ut-defer.md` | `/ut-defer` の本体（役割は上の表） |
 | `commands/ut-envsetup.md` | `/ut-envsetup` の本体（役割は上の表） |
 | `commands/ut-review.md` | `/ut-review` の本体（役割は上の表） |
+| `agents/ut-review-reader.md` | `/ut-review` が使う、読み取りだけ（`Read`・`Grep`・`Glob`）のレビュー役の定義。`--target claude-agents` で `~/.claude/agents/` へ配備する |
 | `commands/templates/ut-report-html-template.html` | `ut-report` の HTML 出力テンプレート |
 | `commands/templates/ut-reportdeck.mjs` | `/ut-reportdeck` の生成部品（依存なしの Node。形の検査・SVG の図・実名とマスクの展開・外部参照とマスク漏れの検査。`--selftest` に自己テスト内蔵） |
 | `commands/templates/ut-reportdeck-template.html` | `/ut-reportdeck` の HTML の器（明暗の両モード・スマホ幅・外部読み込みなし） |
@@ -97,6 +99,8 @@ Claude Code の個人用スラッシュコマンド集です。作者が自分�
 | `tools/ut-archive.mjs` | `/ut-diskarchive` の本体（roots・survey・plan・apply・status・verify-current・confirm-upload・release-archives・deletion-plan・deletion-check。元は移動・削除しない。`--selftest` に自己テスト内蔵） |
 | `tools/ut-archive-win.ps1` | `ut-archive.mjs` の Windows 固有の読み取り（属性・ファイルID・割当・OneDrive のプレースホルダーの状態・同期ルートなど）。中身は開かない |
 | `tools/ut-archive-sweep.mjs` | `ut-archive.mjs` の防御を1つずつ壊して、自己テストが実際に落ちるかを確かめる掃引 |
+| `tools/ut-clean.mjs` | `/ut-diskclean` の本体（scan・apply。削除の判定と実行をツールが行い、承認した計画に載ったものだけを、削除の直前に測り直してから消す。`--selftest` に自己テスト内蔵） |
+| `tools/ut-clean-sweep.mjs` | `ut-clean.mjs` の防御を1つずつ壊して、自己テストが実際に落ちるかを確かめる掃引 |
 | `docs/ut-defer.md` | `/ut-defer` の配備・タスクスケジューラへの登録・復旧の手順と、手元に残るもの |
 | `docs/ut-envsetup.md` | `/ut-envsetup` の profile の書き方と運用 |
 | `docs/ut-reportdeck.md` | `/ut-reportdeck` の設計の理由と限界 |
@@ -120,9 +124,10 @@ cd ut-commands
 node tools/deploy.mjs --check                    # 整合性検査（書き込まない）
 node tools/deploy.mjs --target claude            # 差分の確認（dry-run）
 node tools/deploy.mjs --target claude --apply    # ~/.claude/commands/ へ配置
+node tools/deploy.mjs --target claude-agents --apply   # ~/.claude/agents/ へサブエージェント定義を配置（/ut-review の読み取り専用のレビュー役）
 ```
 
-`deploy.mjs` は **既定が dry-run** で、`--apply` を付けるまで何も書き込みません。Codex 側へ配る場合は `--target codex-skills` を使います（`~/.agents/skills/` へ配置）。
+`deploy.mjs` は **既定が dry-run** で、`--apply` を付けるまで何も書き込みません。サブエージェント定義（`agents/`）は `--target claude-agents` で `~/.claude/agents/` へ配置します（`/ut-review` が読み取りだけのレビュー役に使います。定義の `tools` が読み取りだけに絞られていることは `--check` の C21 が見ます）。Codex 側へ配る場合は `--target codex-skills` を使います（`~/.agents/skills/` へ配置）。
 
 以前の版で Codex の custom prompts（`~/.codex/prompts/ut.md`。`/prompts:ut` で呼ぶ形）を配置していた場合: custom prompts は Codex で非推奨になったため、skills（`$ut`）へ移しました。`--target codex` は廃止しています。`--target codex-skills --apply` で skills を配置したあと、`~/.codex/prompts/ut.md` は要らなければ手で削除してください（`deploy.mjs` は削除をしません）。skills は `agents/openai.yaml` で自動の呼び出しを止めてあり、`$ut` と明示したときだけ動きます。
 

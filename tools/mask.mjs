@@ -56,6 +56,17 @@ const SHAPED = [
   { kind: 'sas-url', re: /\bhttps?:\/\/[^\s"'`)]*[?&]sig=[A-Za-z0-9%+/=]{16,}/gi },
 ];
 
+// 「伏せずに知らせる」だけの形（IP アドレス・GUID）。置換しない。
+// 理由: 手順書の例（127.0.0.1 など）まで伏せると読めなくなり、本文も壊れる。実在の値かどうかは機械では分からないので、
+// 見つけた場所（行）と種別だけを知らせ、人が確かめる。値そのものは出さない。
+// 除外（実在の値になりえないもの）: ループバック・未指定・文書用の範囲（RFC 5737）・全桁が同じ数字の GUID。
+const WARN_SHAPES = [
+  { kind: 'ip', re: /(?<![\d.])(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?![\d]|\.\d)/g,
+    skip: (v) => /^(127\.|0\.0\.0\.0$|192\.0\.2\.|198\.51\.100\.|203\.0\.113\.)/.test(v) },
+  { kind: 'guid', re: /\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b/g,
+    skip: (v) => /^(.)\1*$/.test(v.replace(/-/g, '')) },
+];
+
 // 実ユーザー名を含むホームパス。値ではなく表記を置き換える。
 function homePatterns() {
   const home = os.homedir();
@@ -104,11 +115,20 @@ export function maskText(input) {
     });
   }
 
+  // 伏せずに知らせるもの。入力の本文で数える（置換で形が変わる前の位置を示すため）。
+  // 本文・count・byKind には影響しない（count は「伏せた件数」のまま）。
+  const warnings = [];
+  input.split('\n').forEach((ln, i) => {
+    for (const { kind, re, skip } of WARN_SHAPES) {
+      for (const m of ln.matchAll(re)) if (!skip(m[0])) warnings.push({ kind, line: i + 1, length: m[0].length });
+    }
+  });
+
   // 行番号を付けた要約（値は含めない）
   const byKind = {};
   for (const f of findings) byKind[f.kind] = (byKind[f.kind] || 0) + 1;
 
-  return { text, findings, byKind, count: findings.length };
+  return { text, findings, byKind, count: findings.length, warnings };
 }
 
 // 自己テスト。検出できること(陽性)と、検出してはいけないこと(陰性)の両方を見る。
@@ -144,6 +164,9 @@ function selftest() {
     ['環境変数名だけ', 'setx GROWI_API_TOKEN "発行したトークン"', false],
     ['短い値(閾値未満)', 'token=abc123', false],
     ['プレースホルダ表記', '%USERPROFILE%/.claude/tools', false],
+    // IP・GUID は伏せない（知らせるだけ）。本文が入力と同じことは下の陰性の確認で見る
+    ['IP アドレス（伏せずに知らせる）', 'host 10.20.30.40 に接続', false],
+    ['GUID（伏せずに知らせる）', 'id 3f2504e0-4f89-11d3-9a0c-0305e82c3301', false],
   ];
 
   let fail = 0;
@@ -162,6 +185,23 @@ function selftest() {
       console.log('       NG 陰性なのに本文が書き換わった');
       fail++;
     }
+  }
+  // 知らせる（伏せない）形: 実在になりうる値は警告に出し、例示・ダミーは出さない。値そのものは警告に含めない
+  const warnCases = [
+    ['IP（10.x）', 'host 10.20.30.40 に接続', 'ip', 1],
+    ['IP（行の途中・複数）', 'a 172.16.0.1 b 8.8.8.8', 'ip', 2],
+    ['GUID', 'id 3f2504e0-4f89-11d3-9a0c-0305e82c3301', 'guid', 1],
+    ['IP（ループバック・未指定は除外）', 'http://127.0.0.1:5000 と 0.0.0.0', 'ip', 0],
+    ['IP（文書用の範囲は除外）', '192.0.2.10 / 198.51.100.7 / 203.0.113.9', 'ip', 0],
+    ['IP（5 つ組・長いバージョン番号は拾わない）', 'v1.2.3.4.5 と 10.0.26200.1', 'ip', 0],
+    ['GUID（全桁が同じダミーは除外）', '11111111-1111-1111-1111-111111111111', 'guid', 0],
+  ];
+  for (const [label, input, kind, want] of warnCases) {
+    const r = maskText(input);
+    const got = r.warnings.filter((w) => w.kind === kind).length;
+    const ok = got === want && r.text === input && r.count === 0 && r.warnings.every((w) => Object.keys(w).sort().join() === 'kind,length,line');
+    if (!ok) fail++;
+    console.log((ok ? '  OK   ' : '  NG   ') + '警告 | ' + label + ' | ' + got + '件（期待 ' + want + '）');
   }
   // 引用符で囲んだ値は、中身だけを伏せて引用符を残す（JSON・エスケープした JSON の形を壊さない）
   for (const [input, want] of [
@@ -277,12 +317,21 @@ function main() {
 
   if (report) {
     // 値は出さない。種別と件数と長さだけ
-    fs.writeFileSync(report, JSON.stringify({ count: r.count, byKind: r.byKind, findings: r.findings }, null, 2), 'utf8');
+    fs.writeFileSync(report, JSON.stringify({ count: r.count, byKind: r.byKind, findings: r.findings, warnings: r.warnings }, null, 2), 'utf8');
   }
 
   console.error('[mask] 検出 ' + r.count + ' 件' + (r.count ? ' : ' + JSON.stringify(r.byKind) : ''));
   if (r.count > 0) {
     console.error('[mask] 値は出力しません。置換後の本文を人手で確認してください。');
+  }
+  if (r.warnings.length > 0) {
+    // 伏せていない。実在の値かどうかは人が確かめる（値は出さない）
+    const by = {};
+    for (const w of r.warnings) (by[w.kind] = by[w.kind] || []).push(w.line);
+    const label = { ip: 'IP アドレスらしい値', guid: 'GUID らしい値' };
+    for (const [k, ls] of Object.entries(by)) {
+      console.error('[mask] 注意（伏せていません）: ' + label[k] + ' ' + ls.length + ' 件（行 ' + [...new Set(ls)].slice(0, 20).join(', ') + (ls.length > 20 ? ' ほか' : '') + '）。実在の値なら人が伏せてください。');
+    }
   }
   console.error('[mask] 固有名詞(顧客名・テナント名・個人名)は機械判定しません。人手レビューで確認してください。');
   process.exit(0);

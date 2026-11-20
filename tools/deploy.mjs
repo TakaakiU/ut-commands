@@ -72,6 +72,19 @@ const TARGETS = {
       return [...topLevel, ...templates].sort();
     },
   },
+  // Claude Code のサブエージェント定義（読み取り専用のレビュー役など）。配置先はユーザー単位の ~/.claude/agents。
+  // 扱うのは agents/ の ut-*.md だけ。配置先の他の定義は列挙もしない（他者の定義を取り込んだり上書きしたりしないため）
+  'claude-agents': {
+    repoDir: path.join(REPO_ROOT, 'agents'),
+    repoDirName: 'agents',
+    liveDir: path.join(HOME, '.claude', 'agents'),
+    description: 'Claude Code サブエージェント定義',
+    filePatternLabel: 'ut-*.md',
+    restartHint: 'Claude Code のセッションを開き直すと反映されます。',
+    listFiles(dir) {
+      return listTopLevelFiles(dir).filter((n) => n.startsWith(PREFIX) && n.endsWith(SUFFIX)).sort();
+    },
+  },
   // Codex skills（custom prompts の後継）。配置先はユーザー単位の ~/.agents/skills。
   // 扱うのは codex-skills/ にある skill の名前と、その中の決まったファイル（SKILL_FILES）だけ。
   // 配置先の他の skill は列挙もしない（他者の skill を取り込んだり上書きしたりしないため）
@@ -134,9 +147,9 @@ for (let i = 0; i < argv.length; i++) {
 }
 if (unknown.length) fail(`不明な引数: ${unknown.join(' ')}`);
 if (has('--help') || has('-h')) { usage(); process.exit(0); }
-if (targetIndex >= 0 && !argv[targetIndex + 1]) fail('--target の値がありません。claude / codex-skills のいずれかを指定してください。');
+if (targetIndex >= 0 && !argv[targetIndex + 1]) fail('--target の値がありません。claude / claude-agents / codex-skills のいずれかを指定してください。');
 if (targetName === 'codex') fail('--target codex（旧入口の custom prompts）は撤去しました。Codex 側は --target codex-skills を使ってください（配置済みの ~/.codex/prompts/ の旧ファイルは削除しないので、要らなければ手で消す）。');
-if (!Object.hasOwn(TARGETS, targetName)) fail(`不明な target: ${targetName} (claude / codex-skills のみ対応)。`);
+if (!Object.hasOwn(TARGETS, targetName)) fail(`不明な target: ${targetName} (claude / claude-agents / codex-skills のみ対応)。`);
 if (has('--apply') && has('--capture')) {
   fail('--apply と --capture は同時に指定できません(どちら向きに上書きするかが決まらない)。');
 }
@@ -220,6 +233,8 @@ function usage() {
   node tools/deploy.mjs --dry-run                      状態表示のみ(書き込まないことの明示。--apply / --capture / --check と同時に指定すると、何も書かずに exit 2 で止まる)
   node tools/deploy.mjs --target claude --apply       正本 → ${TARGETS.claude.liveDir}
   node tools/deploy.mjs --target claude --capture     ${TARGETS.claude.liveDir} → 正本
+  node tools/deploy.mjs --target claude-agents --apply ${TARGETS['claude-agents'].liveDir} へサブエージェント定義を配置（agents/ の ut-*.md だけ）
+  node tools/deploy.mjs --target claude-agents --capture ${TARGETS['claude-agents'].liveDir} → 正本（同上）
   node tools/deploy.mjs --target codex-skills --apply ${TARGETS['codex-skills'].liveDir} へ skills を配置（codex-skills/ にある skill だけ）
   node tools/deploy.mjs --target codex-skills --capture ${TARGETS['codex-skills'].liveDir} → 正本（同上）
   node tools/deploy.mjs ... --force                   食い違いも上書き(上書き前に .bak-<時刻>-<ミリ秒> を残す)
@@ -240,7 +255,8 @@ Codex skills 対象は codex-skills/<名前>/ の SKILL.md と agents/openai.yam
           C17 ディスク系の入口と出口の説明（description・argument-hint） /
           C18 commands/templates/ と Claude 配置先 templates/ の入れ子に .md を置かない（Claude Code がコマンドや skill として読み込む） /
           C19 /ut-handoff と /ut-takeover に「セッションの示し方」の決まりと禁止がある /
-          C20 Claude Code にしか無い機能に頼る ut-*.md に「前提と、無いときの動作」表の行がある（警告。配備は止めない）`);
+          C20 Claude Code にしか無い機能に頼る ut-*.md に「前提と、無いときの動作」表の行がある（警告。配備は止めない） /
+          C21 agents/ の読み取り専用サブエージェント定義が、tools を Read・Grep・Glob だけに絞っている`);
 }
 
 // ---- 整合性検査(--check) ------------------------------------------------
@@ -811,6 +827,9 @@ function runChecks(captureTarget) {
   // C20: Claude Code にしか無い機能と「前提と、無いときの動作」表（警告。方針 §2.3）
   checkClaudeOnlyFeatures(tree, add);
 
+  // C21: 読み取り専用のサブエージェント定義が、道具を読み取りだけに絞っていること
+  checkReadOnlyAgents(tree, add);
+
   // C3: commands/ 本文中の templates 参照が実在するか
   const templateRe = /commands\/templates\/[A-Za-z0-9._-]+/g;
   for (const name of tree.listFiles('claude')) {
@@ -1287,6 +1306,39 @@ function checkSessionLabel(tree, add) {
       const sec = sectionLines(text, title);
       if (!sec || !sec.includes(want)) add('C19', 'error', `commands/${name} の「${title}」に「セッションの示し方」の${what}が無い・文言が違う（全文は tools/deploy.mjs の ${konst}）`);
     }
+  }
+}
+
+// ---- C21: 読み取り専用のサブエージェント定義（agents/ut-*.md） ------------------------------
+// サブエージェントの定義は、frontmatter に tools が無いと全部の道具を継承する。「読み取りだけ」のつもりで置いた定義が、
+// tools の書き忘れ・書き換えで、エラーなしに書き込みもコマンド実行もできる状態になる（docs/command-design.md §7）。
+// 見るのは 4 つだけ: frontmatter が読めること・name がファイル名と一致すること・description があること・
+// tools が空でなく、読み取りの道具（Read・Grep・Glob）だけであること。
+// frontmatter のキーは name・description・tools・model だけを許す（permissionMode・hooks・mcpServers などで、制限の意味が変わるのを防ぐ）。
+// tools の値は 1 行のカンマ区切りだけを読む（YAML のリストは読まずにエラーにする。読み違えて通すより止める）。
+const READONLY_AGENT_TOOLS = new Set(['Read', 'Grep', 'Glob']);
+const READONLY_AGENT_KEYS = new Set(['name', 'description', 'tools', 'model']);
+function checkReadOnlyAgents(tree, add) {
+  for (const name of tree.listFiles('claude-agents')) {
+    const b = tree.read(`agents/${toPosix(name)}`);
+    if (!b) continue;
+    const where = `agents/${toPosix(name)}`;
+    const fm = readFrontmatter(b.toString('utf8'));
+    if (!fm) { add('C21', 'error', `${where} に frontmatter が無い（tools が無いと全部の道具を継承する）`); continue; }
+    if (fm.error) { add('C21', 'error', `${where} の frontmatter が壊れている: ${fm.error}`); continue; }
+    const vals = {};
+    for (const e of fm.entries) {
+      if (!READONLY_AGENT_KEYS.has(e.key)) { add('C21', 'error', `${where} の frontmatter のキー ${e.key} は許していない（許すのは ${[...READONLY_AGENT_KEYS].join('・')}）`); continue; }
+      const v = frontmatterScalar(e);
+      if (v.error) { add('C21', 'error', `${where} の ${e.key} の値の${v.error}`); continue; }
+      vals[e.key] = v.value;
+    }
+    if (vals.name !== path.basename(name, SUFFIX)) add('C21', 'error', `${where} の name（${vals.name ?? '無し'}）がファイル名と一致しない`);
+    if (!vals.description) add('C21', 'error', `${where} に description が無い`);
+    if (vals.tools === undefined || vals.tools === '') { add('C21', 'error', `${where} に tools が無い（無いと全部の道具を継承し、読み取り専用にならない）`); continue; }
+    const tools = vals.tools.split(',').map((x) => x.trim());
+    const bad = tools.filter((x) => !READONLY_AGENT_TOOLS.has(x));
+    if (bad.length || tools.some((x) => x === '')) add('C21', 'error', `${where} の tools に読み取り以外の道具・空の項目がある: ${bad.concat(tools.some((x) => x === '') ? ['(空)'] : []).join(', ')}（許すのは ${[...READONLY_AGENT_TOOLS].join('・')}）`);
   }
 }
 
